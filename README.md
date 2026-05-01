@@ -151,8 +151,8 @@ See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) for:
 ## Authors
 
 * **Vishal Kumar Swain** (NIT Warangal)
-* **Dr. Sangharatna Godboley** (NIT Warangal)
-* **Dr. P. Radha Krishna** (NIT Warangal)
+* **Sangharatna Godboley** (NIT Warangal)
+* **P. Radha Krishna** (NIT Warangal)
 * **Avijit Das** (DRDO, LRDE Bengaluru)
 * **Bhaskar Sri Viswaroopanand** (Manipal University Jaipur)
 
