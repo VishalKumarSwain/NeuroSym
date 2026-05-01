@@ -162,18 +162,3 @@ See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) for:
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
----
-
-## Citation
-
-If you use NeuroSym in your research, please cite:
-
-```bibtex
-@misc{neurosym2026,
-  title  = {NeuroSym: A Neural-Symbolic SMT Solver using Iterative Refinement GANs},
-  author = {Swain, Vishal Kumar and Godboley, Sangharatna and Krishna, P. Radha
-            and Das, Avijit and Viswaroopanand, Bhaskar Sri},
-  year   = {2026},
-  note   = {SMT-COMP 2026 submission}
-}
-```
