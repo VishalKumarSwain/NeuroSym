@@ -1,0 +1,14 @@
+{
+  "name": "NeuroSym",
+  "version": "1.0-pre",
+  "authors": [
+    "Vishal Kumar Swain",
+    "Sangharatna Godboley",
+    "P. Radha Krishna",
+    "Avijit Das",
+    "Bhaskar Sri Viswaroopanand"
+  ],
+  "github": "https://github.com/VishalKumarSwain/NeuroSym",
+  "track": "SingleQuery",
+  "logics": ["QF_LIA", "QF_BV", "QF_ABV"]
+}
