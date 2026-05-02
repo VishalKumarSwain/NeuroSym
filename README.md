@@ -154,7 +154,6 @@ See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) for:
 * **Sangharatna Godboley** (NIT Warangal)
 * **P. Radha Krishna** (NIT Warangal)
 * **Avijit Das** (DRDO, LRDE Bengaluru)
-* **Bhaskar Sri Viswaroopanand** (Manipal University Jaipur)
 
 ---
 
