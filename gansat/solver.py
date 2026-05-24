@@ -223,25 +223,17 @@ class GANSATSolver:
         """Solve using Bitwuzla via its SMT-LIB 2 parser."""
         tm   = _bwz.TermManager()
         opts = _bwz.Options()
-        opts.set(_bwz.Option.PRODUCE_MODELS,    True)
-        opts.set(_bwz.Option.TIME_LIMIT_PER,    timeout_ms)
-        opts.set(_bwz.Option.VERBOSITY,         0)
-
+        opts.set(_bwz.Option.PRODUCE_MODELS, True)
+        opts.set(_bwz.Option.TIME_LIMIT_PER, timeout_ms)
+        opts.set(_bwz.Option.VERBOSITY,      0)
         try:
             parser = _bwz.Parser(tm, opts)
-            parser.parse(smtlib_str, parse_only=True, is_file=False)
-            bwz    = _bwz.Bitwuzla(tm, opts)
-
-            for assertion in parser.get_declared_funs():
-                pass
-
-            bwz2   = parser.bitwuzla()
-            result = bwz2.check_sat()
-
-            if str(result) == "sat":
-                return RESULT_SAT, {}
-            elif str(result) == "unsat":
-                return RESULT_UNSAT, None
+            parser.parse(smtlib_str, parse_only=True, parse_file=False)
+            bwz    = parser.bitwuzla()
+            result = bwz.check_sat()
+            s = str(result)
+            if s == "sat":   return RESULT_SAT,   {}
+            if s == "unsat": return RESULT_UNSAT, None
             return RESULT_UNKNOWN, None
         except Exception:
             return RESULT_UNKNOWN, None
