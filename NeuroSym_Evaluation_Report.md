@@ -55,8 +55,9 @@ Training used the **official SMT-COMP 2025 benchmark set** (downloaded from Zeno
 |--------|-------|---------------------|
 | SMT-COMP 2025 QF\_BV | 10,703 | ~4,200 |
 | SMT-COMP 2025 QF\_ABV | 7,574 | ~2,100 |
+| SMT-COMP 2025 QF\_LIA | 4,825 | 1,964 |
 | Synthetic (KLEE-style, bitwise, signed, mixed) | 10,000 | ~1,400 |
-| **Total** | **25,375** | **~7,700** |
+| **Total** | **30,200** | **~9,664** |
 
 ### Training Configuration
 - Epochs: 100 | Batch size: 16 | Learning rate: 1×10⁻⁴
@@ -68,7 +69,7 @@ Training used the **official SMT-COMP 2025 benchmark set** (downloaded from Zeno
 
 | Model | Theory | Best Generator Loss |
 |-------|--------|---------------------|
-| `gansat_lia.pt` | QF\_LIA | **1.3255** (100 epochs) |
+| `gansat_lia.pt` | QF\_LIA | **1.0079** (100 epochs, real SMT-COMP 2025 data) |
 | `gansat_bv.pt`  | QF\_BV  | **5.0715** (100 epochs, real competition data) |
 
 ---
