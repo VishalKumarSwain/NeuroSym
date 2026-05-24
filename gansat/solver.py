@@ -46,7 +46,7 @@ class GANSATSolver:
         model_path:     str  = None,
         bv_model_path:  str  = None,
         lia_model_path: str  = None,
-        n_candidates:   int  = 32,
+        n_candidates:   int  = 8,
         timeout_ms:     int  = 20_000,
         device:         str  = "cpu",
         portfolio:      bool = True,
@@ -132,6 +132,20 @@ class GANSATSolver:
                     return r, m, (time.time() - t0) * 1000
             except queue.Empty:
                 pass
+
+        # Bitwuzla intermediate wait: give Bitwuzla up to 1.5s before committing
+        # Z3 to the full remaining timeout. This catches the common case where
+        # Bitwuzla answers in ~500-1500ms while Z3 would waste 4-5s and miss it.
+        if self.portfolio and logic in _BV_LOGICS:
+            bwz_pre = min(1.5, remaining_ms / 1000.0 * 0.3)
+            try:
+                r, m = bwz_q.get(timeout=bwz_pre)
+                if r in (RESULT_SAT, RESULT_UNSAT):
+                    return r, m, (time.time() - t0) * 1000
+            except queue.Empty:
+                pass
+            elapsed_ms   = int((time.time() - t0) * 1000)
+            remaining_ms = max(self.timeout_ms - elapsed_ms, 500)
 
         # Run Z3 on main thread
         z3_result, z3_model = self._z3_solve(formula, logic, remaining_ms)

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL maintainer="NIT Warangal / University of Manchester — NeuroSym SMT-COMP '26"
 LABEL description="NeuroSym: GAN + Z3 + Bitwuzla portfolio solver for QF_LIA, QF_BV, QF_ABV"
-LABEL version="1.0"
+LABEL version="1.1"
 
 WORKDIR /neurosym
 

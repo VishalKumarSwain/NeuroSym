@@ -8,7 +8,7 @@ SMT-COMP interface:
 
 Usage (SMT-COMP harness):
     python main.py benchmark.smt2
-    python main.py --model models/gansat.pt benchmark.smt2
+    python main.py --bv-model models/gansat_bv.pt benchmark.smt2
     echo "(set-logic QF_LIA)..." | python main.py --stdin
 """
 
@@ -26,18 +26,24 @@ from gansat.solver import GANSATSolver, format_output, RESULT_SAT, RESULT_UNSAT
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("input_file", nargs="?", default=None)
-    parser.add_argument("--model",      default=os.path.join(_ROOT, "models", "gansat.pt"))
-    parser.add_argument("--stdin",      action="store_true")
-    parser.add_argument("--candidates", type=int, default=16)
-    parser.add_argument("--timeout",    type=int, default=20_000)
-    parser.add_argument("--device",     default="cpu")
+    parser.add_argument("input_file",  nargs="?", default=None)
+    parser.add_argument("--model",     default=os.path.join(_ROOT, "models", "gansat.pt"))
+    parser.add_argument("--bv-model",  default=os.path.join(_ROOT, "models", "gansat_bv.pt"))
+    parser.add_argument("--lia-model", default=os.path.join(_ROOT, "models", "gansat_lia.pt"))
+    parser.add_argument("--stdin",     action="store_true")
+    parser.add_argument("--candidates", type=int, default=8)
+    parser.add_argument("--timeout",   type=int, default=20_000)
+    parser.add_argument("--device",    default="cpu")
     args = parser.parse_args()
 
-    model_path = args.model if os.path.exists(args.model) else None
+    bv_model_path  = args.bv_model  if os.path.exists(args.bv_model)  else None
+    lia_model_path = args.lia_model if os.path.exists(args.lia_model) else None
+    model_path     = args.model     if os.path.exists(args.model)     else None
 
     solver = GANSATSolver(
         model_path=model_path,
+        bv_model_path=bv_model_path,
+        lia_model_path=lia_model_path,
         n_candidates=args.candidates,
         timeout_ms=args.timeout,
         device=args.device,
