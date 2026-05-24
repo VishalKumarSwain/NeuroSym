@@ -46,7 +46,7 @@ class GANSATSolver:
         model_path:     str  = None,
         bv_model_path:  str  = None,
         lia_model_path: str  = None,
-        n_candidates:   int  = 16,
+        n_candidates:   int  = 32,
         timeout_ms:     int  = 20_000,
         device:         str  = "cpu",
         portfolio:      bool = True,
@@ -87,28 +87,46 @@ class GANSATSolver:
         t0    = time.time()
         logic = formula.logic.upper()
 
-        # ── Step 1: GAN fast path ─────────────────────────────────────────────
+        # ── True parallel: GAN fast path + portfolio race simultaneously ──────
+        # Portfolio runs in a background thread from t=0.
+        # GAN runs on the main thread (~5–15ms).
+        # Whichever produces the first definitive answer wins.
+        result_q = queue.Queue()
+
+        def _portfolio_worker():
+            try:
+                if self.portfolio and logic in _BV_LOGICS:
+                    r, m = self._portfolio_solve(formula, logic, self.timeout_ms)
+                elif logic in _LIA_LOGICS or formula.variables:
+                    r, m = self._z3_solve(formula, logic, self.timeout_ms)
+                else:
+                    r, m = RESULT_UNKNOWN, None
+                result_q.put(("portfolio", r, m))
+            except Exception:
+                result_q.put(("portfolio", RESULT_UNKNOWN, None))
+
+        t_portfolio = threading.Thread(target=_portfolio_worker, daemon=True)
+        t_portfolio.start()
+
+        # GAN fast path on main thread
+        gan_result, gan_model = RESULT_UNKNOWN, None
         try:
             if logic in _BV_LOGICS:
-                result, model = self._bv_fast_path(formula)
+                gan_result, gan_model = self._bv_fast_path(formula)
             elif logic in _LIA_LOGICS or formula.variables:
-                result, model = self._lia_fast_path(formula)
-            else:
-                result, model = RESULT_UNKNOWN, None
+                gan_result, gan_model = self._lia_fast_path(formula)
         except Exception:
+            pass
+
+        if gan_result == RESULT_SAT:
+            return gan_result, gan_model, (time.time() - t0) * 1000
+
+        # GAN missed — wait for portfolio result
+        timeout_remaining = max(self.timeout_ms / 1000.0 - (time.time() - t0) + 2.0, 2.0)
+        try:
+            _, result, model = result_q.get(timeout=timeout_remaining)
+        except queue.Empty:
             result, model = RESULT_UNKNOWN, None
-
-        if result == RESULT_SAT:
-            return result, model, (time.time() - t0) * 1000
-
-        # ── Step 2: Portfolio (Z3 + Bitwuzla race) or Z3 only ────────────────
-        remaining_ms = self.timeout_ms - int((time.time() - t0) * 1000)
-        remaining_ms = max(remaining_ms, 1000)
-
-        if self.portfolio and logic in _BV_LOGICS:
-            result, model = self._portfolio_solve(formula, logic, remaining_ms)
-        else:
-            result, model = self._z3_solve(formula, logic, remaining_ms)
 
         return result, model, (time.time() - t0) * 1000
 
