@@ -1,11 +1,14 @@
 """
-Download real QF_BV benchmarks from:
-  1. bitwuzla regression suite (749 BV files)
-  2. STP regression suite (75 files)
-Then generate high-quality synthetic benchmarks to reach target count.
+Download real QF_BV benchmarks from multiple sources:
+  1. bitwuzla regression suite (all BV files)
+  2. STP regression suite
+  3. Z3 regression tests (QF_BV)
+  4. CVC5 regression tests (QF_BV)
+  5. Boolector regression tests
+Then generate high-quality synthetic benchmarks.
 
 Usage:
-    python scripts/download_bv_benchmarks.py --out data/bv_benchmarks --synthetic 3000
+    python scripts/download_bv_benchmarks.py --out data/bv_benchmarks --synthetic 10000
 """
 
 import argparse
@@ -16,25 +19,51 @@ import time
 import urllib.request
 from pathlib import Path
 
-BITWUZLA_TREE_URL = (
-    "https://api.github.com/repos/bitwuzla/bitwuzla/git/trees/HEAD?recursive=1"
-)
-BITWUZLA_RAW = "https://raw.githubusercontent.com/bitwuzla/bitwuzla/main/"
-
-STP_TREE_URL = "https://api.github.com/repos/stp/stp/git/trees/HEAD?recursive=1"
-STP_RAW = "https://raw.githubusercontent.com/stp/stp/master/"
+SOURCES = {
+    "bitwuzla": {
+        "tree_url": "https://api.github.com/repos/bitwuzla/bitwuzla/git/trees/HEAD?recursive=1",
+        "raw_base": "https://raw.githubusercontent.com/bitwuzla/bitwuzla/main/",
+        "filter":   lambda p: p.endswith(".smt2") and "bv" in p.lower(),
+        "max":      2000,
+    },
+    "stp": {
+        "tree_url": "https://api.github.com/repos/stp/stp/git/trees/HEAD?recursive=1",
+        "raw_base": "https://raw.githubusercontent.com/stp/stp/master/",
+        "filter":   lambda p: p.endswith(".smt2"),
+        "max":      500,
+    },
+    "z3": {
+        "tree_url": "https://api.github.com/repos/Z3Prover/z3/git/trees/HEAD?recursive=1",
+        "raw_base": "https://raw.githubusercontent.com/Z3Prover/z3/master/",
+        "filter":   lambda p: p.endswith(".smt2") and "bv" in p.lower(),
+        "max":      1000,
+    },
+    "cvc5": {
+        "tree_url": "https://api.github.com/repos/cvc5/cvc5/git/trees/HEAD?recursive=1",
+        "raw_base": "https://raw.githubusercontent.com/cvc5/cvc5/main/",
+        "filter":   lambda p: p.endswith(".smt2") and "QF_BV" in p,
+        "max":      1000,
+    },
+    "boolector": {
+        "tree_url": "https://api.github.com/repos/Boolector/boolector/git/trees/HEAD?recursive=1",
+        "raw_base": "https://raw.githubusercontent.com/Boolector/boolector/master/",
+        "filter":   lambda p: p.endswith(".smt2"),
+        "max":      500,
+    },
+}
 
 
 def _fetch_json(url, timeout=30):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    req = urllib.request.Request(url, headers={"User-Agent": "NeuroSym-downloader/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
-def _download_file(raw_base, path, dest: Path, retries=3):
-    url = raw_base + path
+def _download_file(url, dest: Path, retries=3):
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(url, timeout=20) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "NeuroSym-downloader/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
                 dest.write_bytes(r.read())
             return True
         except Exception:
@@ -43,60 +72,41 @@ def _download_file(raw_base, path, dest: Path, retries=3):
     return False
 
 
-def download_bitwuzla(out_dir: Path, max_files: int = 750):
-    print("[bitwuzla] Fetching file tree...")
+def download_source(name: str, cfg: dict, out_dir: Path) -> int:
+    print(f"[{name}] Fetching file tree...")
     try:
-        tree = _fetch_json(BITWUZLA_TREE_URL)
+        data = _fetch_json(cfg["tree_url"])
     except Exception as e:
-        print(f"[bitwuzla] Failed to fetch tree: {e}")
+        print(f"[{name}] Failed to fetch tree: {e}")
         return 0
 
-    bv_files = [
-        x["path"] for x in tree.get("tree", [])
-        if x["path"].endswith(".smt2") and "bv" in x["path"].lower()
-    ]
-    bv_files = bv_files[:max_files]
-    print(f"[bitwuzla] Found {len(bv_files)} BV .smt2 files — downloading...")
+    files = [x["path"] for x in data.get("tree", []) if cfg["filter"](x["path"])]
+    files = files[:cfg["max"]]
+    print(f"[{name}] Found {len(files)} matching .smt2 files — downloading...")
 
-    dest_dir = out_dir / "bitwuzla"
+    dest_dir = out_dir / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     ok = 0
-    for i, path in enumerate(bv_files):
-        fname = dest_dir / f"bwz_{i:04d}_{Path(path).name}"
+    for i, path in enumerate(files):
+        fname = dest_dir / f"{name}_{i:05d}_{Path(path).name}"
         if fname.exists():
             ok += 1
             continue
-        if _download_file(BITWUZLA_RAW, path, fname):
+        url = cfg["raw_base"] + path
+        if _download_file(url, fname):
             ok += 1
-        if (i + 1) % 50 == 0:
-            print(f"  {i+1}/{len(bv_files)}  ({ok} ok)")
-    print(f"[bitwuzla] Downloaded {ok}/{len(bv_files)}")
+        if (i + 1) % 100 == 0:
+            print(f"  [{name}] {i+1}/{len(files)}  ({ok} ok)")
+    print(f"[{name}] Downloaded {ok}/{len(files)}")
     return ok
+
+
+def download_bitwuzla(out_dir: Path, max_files: int = 2000):
+    return download_source("bitwuzla", {**SOURCES["bitwuzla"], "max": max_files}, out_dir)
 
 
 def download_stp(out_dir: Path):
-    print("[stp] Fetching file tree...")
-    try:
-        tree = _fetch_json(STP_TREE_URL)
-    except Exception as e:
-        print(f"[stp] Failed: {e}")
-        return 0
-
-    smt_files = [x["path"] for x in tree.get("tree", []) if x["path"].endswith(".smt2")]
-    print(f"[stp] Found {len(smt_files)} .smt2 files — downloading...")
-
-    dest_dir = out_dir / "stp"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    ok = 0
-    for i, path in enumerate(smt_files):
-        fname = dest_dir / f"stp_{i:04d}_{Path(path).name}"
-        if fname.exists():
-            ok += 1
-            continue
-        if _download_file(STP_RAW, path, fname):
-            ok += 1
-    print(f"[stp] Downloaded {ok}/{len(smt_files)}")
-    return ok
+    return download_source("stp", SOURCES["stp"], out_dir)
 
 
 # ── High-quality synthetic generator ──────────────────────────────────────────
@@ -274,10 +284,13 @@ def generate_mixed_arith(out_dir: Path, n: int):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out",       default="data/bv_benchmarks")
-    parser.add_argument("--synthetic", type=int, default=3000,
+    parser.add_argument("--synthetic", type=int, default=10000,
                         help="Number of synthetic benchmarks to generate")
     parser.add_argument("--no_real",   action="store_true",
                         help="Skip downloading real benchmarks")
+    parser.add_argument("--sources",   nargs="+",
+                        default=["bitwuzla", "stp", "z3", "cvc5", "boolector"],
+                        help="Which real sources to download")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -285,8 +298,11 @@ def main():
     total = 0
 
     if not args.no_real:
-        total += download_bitwuzla(out)
-        total += download_stp(out)
+        for src in args.sources:
+            if src in SOURCES:
+                total += download_source(src, SOURCES[src], out)
+            else:
+                print(f"[warning] Unknown source: {src}")
 
     if args.synthetic > 0:
         n = args.synthetic

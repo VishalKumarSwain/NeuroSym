@@ -16,6 +16,8 @@ import sys
 import os
 import argparse
 
+sys.setrecursionlimit(100000)
+
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 

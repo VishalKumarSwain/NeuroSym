@@ -14,6 +14,8 @@ To generate synthetic QF_BV training data:
 import argparse
 import sys
 import random
+import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -32,52 +34,84 @@ from gansat.bv_gan      import (
     BVIterativeGenerator, BVDiscriminator, bv_assignment_to_tensor, BV_NOISE_DIM
 )
 
+# ── Subprocess worker entrypoint (called as __main__) ─────────────────────────
+# When invoked as: python train_bv.py --_worker <path> <max_ms>
+# Prints JSON result to stdout, exits 0 on success or 1 on failure.
+def _worker_main():
+    path       = sys.argv[sys.argv.index("--_worker") + 1]
+    max_ms     = int(sys.argv[sys.argv.index("--_worker") + 2])
+    try:
+        formula = parse_file(path)
+        if not formula.variables:
+            sys.exit(1)
+        if formula.logic not in ("QF_BV", "QF_ABV", "BV", "UNKNOWN"):
+            sys.exit(1)
+        solver = z3.Solver()
+        solver.set("timeout", max_ms)
+        for a in formula.assertions:
+            solver.add(a)
+        if solver.check() != z3.sat:
+            sys.exit(1)
+        model = solver.model()
+        widths = {}
+        assignment = {}
+        for d in model.decls():
+            val = model[d]
+            if val is None:
+                continue
+            if z3.is_bv_value(val):
+                widths[str(d)]     = val.sort().size()
+                assignment[str(d)] = val.as_long()
+        if not assignment:
+            sys.exit(1)
+        formula_enc = bv_encode(formula).tolist()
+        assign_enc  = bv_assignment_to_tensor(
+            assignment, formula.var_names, widths
+        ).numpy().tolist()
+        print(json.dumps({"fe": formula_enc, "ae": assign_enc}))
+        sys.exit(0)
+    except Exception:
+        sys.exit(1)
+
+
+def _process_file_with_timeout(path, max_solve_ms, timeout_sec=15):
+    """Process a single SMT2 file in an isolated subprocess — crash-safe."""
+    try:
+        result = subprocess.run(
+            [sys.executable, __file__, "--_worker", str(path), str(max_solve_ms)],
+            capture_output=True, text=True, timeout=timeout_sec
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            return (np.array(data["fe"], dtype=np.float32),
+                    np.array(data["ae"], dtype=np.float32))
+    except Exception:
+        pass
+    return None
+
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class BVSMTDataset(Dataset):
-    def __init__(self, smt2_files: list, max_solve_ms: int = 5000):
+    def __init__(self, smt2_files: list, max_solve_ms: int = 5000,
+                 file_timeout_sec: int = 15, num_workers: int = 8):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         self.samples = []
-        print(f"[bv_dataset] Solving {len(smt2_files)} QF_BV benchmarks...")
-        solver = z3.Solver()
+        print(f"[bv_dataset] Solving {len(smt2_files)} QF_BV benchmarks "
+              f"(timeout={file_timeout_sec}s/file, {num_workers} parallel workers)...")
 
-        for path in tqdm(smt2_files):
-            try:
-                formula = parse_file(str(path))
-                if not formula.variables:
-                    continue
-                if formula.logic not in ("QF_BV", "QF_ABV", "BV", "UNKNOWN"):
-                    continue
-
-                solver.reset()
-                solver.set("timeout", max_solve_ms)
-                for a in formula.assertions:
-                    solver.add(a)
-                if solver.check() != z3.sat:
-                    continue
-
-                model  = solver.model()
-                widths = {}
-                assignment = {}
-                for d in model.decls():
-                    val = model[d]
-                    if val is None:
-                        continue
-                    if z3.is_bv_value(val):
-                        widths[str(d)]     = val.sort().size()
-                        assignment[str(d)] = val.as_long()
-
-                if not assignment:
-                    continue
-
-                formula_enc = bv_encode(formula)
-                assign_enc  = bv_assignment_to_tensor(
-                    assignment, formula.var_names, widths
-                ).numpy()
-                self.samples.append((formula_enc, assign_enc))
-
-            except Exception:
-                continue
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(_process_file_with_timeout, f, max_solve_ms, file_timeout_sec): f
+                for f in smt2_files
+            }
+            for future in tqdm(as_completed(futures), total=len(smt2_files)):
+                try:
+                    sample = future.result()
+                    if sample is not None:
+                        self.samples.append(sample)
+                except Exception:
+                    pass
 
         print(f"[bv_dataset] Collected {len(self.samples)} BV SAT training pairs.")
 
@@ -219,7 +253,7 @@ def train_bv(
         if epoch % checkpoint_every == 0 or epoch == epochs:
             Path(out_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(G.state_dict(), out_path)
-            print(f"[checkpoint] → {out_path}")
+            print(f"[checkpoint] -> {out_path}")
 
         if avg_g < best_g:
             best_g = avg_g
@@ -230,6 +264,10 @@ def train_bv(
 
 
 def main():
+    if "--_worker" in sys.argv:
+        _worker_main()
+        return
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--data",        default="data/bv_benchmarks")
     parser.add_argument("--out",         default="models/gansat_bv.pt")

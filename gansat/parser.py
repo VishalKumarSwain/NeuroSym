@@ -1,9 +1,12 @@
 """SMT-LIB 2 parser — wraps Z3's native parser and extracts structured formula data."""
 
+import sys
 import z3
 from dataclasses import dataclass, field
 from typing import Optional
 import re
+
+sys.setrecursionlimit(100000)
 
 
 @dataclass
@@ -44,13 +47,15 @@ def _extract_logic(smtlib_str: str) -> str:
 
 def _collect_variables(assertions: list) -> dict:
     seen = {}
-    for expr in assertions:
-        _walk(expr, seen)
+    visited = set()
+    stack = list(assertions)
+    while stack:
+        expr = stack.pop()
+        eid = expr.get_id()
+        if eid in visited:
+            continue
+        visited.add(eid)
+        if z3.is_const(expr) and expr.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+            seen[str(expr)] = expr
+        stack.extend(expr.children())
     return seen
-
-
-def _walk(expr: z3.ExprRef, seen: dict):
-    if z3.is_const(expr) and expr.decl().kind() == z3.Z3_OP_UNINTERPRETED:
-        seen[str(expr)] = expr
-    for child in expr.children():
-        _walk(child, seen)
