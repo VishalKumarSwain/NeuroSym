@@ -87,28 +87,27 @@ class GANSATSolver:
         t0    = time.time()
         logic = formula.logic.upper()
 
-        # ── True parallel: GAN fast path + portfolio race simultaneously ──────
-        # Portfolio runs in a background thread from t=0.
-        # GAN runs on the main thread (~5–15ms).
-        # Whichever produces the first definitive answer wins.
-        result_q = queue.Queue()
+        # ── Strategy ──────────────────────────────────────────────────────────
+        # Z3 is NOT thread-safe across threads. So:
+        #   • Bitwuzla (C++ library, own memory) → background thread from t=0
+        #   • GAN verification (uses Z3) + Z3 fallback → main thread only
+        # This gives Bitwuzla a head-start while the GAN runs, eliminating
+        # the sequential penalty without any Z3 thread-safety issues.
 
-        def _portfolio_worker():
+        bwz_q = queue.Queue()
+
+        def _run_bitwuzla():
             try:
-                if self.portfolio and logic in _BV_LOGICS:
-                    r, m = self._portfolio_solve(formula, logic, self.timeout_ms)
-                elif logic in _LIA_LOGICS or formula.variables:
-                    r, m = self._z3_solve(formula, logic, self.timeout_ms)
-                else:
-                    r, m = RESULT_UNKNOWN, None
-                result_q.put(("portfolio", r, m))
+                r, m = self._bitwuzla_solve(formula.source, self.timeout_ms)
+                bwz_q.put((r, m))
             except Exception:
-                result_q.put(("portfolio", RESULT_UNKNOWN, None))
+                bwz_q.put((RESULT_UNKNOWN, None))
 
-        t_portfolio = threading.Thread(target=_portfolio_worker, daemon=True)
-        t_portfolio.start()
+        # Start Bitwuzla immediately in background (BV only)
+        if self.portfolio and logic in _BV_LOGICS:
+            threading.Thread(target=_run_bitwuzla, daemon=True).start()
 
-        # GAN fast path on main thread
+        # ── GAN fast path (main thread — Z3 verification here is safe) ───────
         gan_result, gan_model = RESULT_UNKNOWN, None
         try:
             if logic in _BV_LOGICS:
@@ -121,14 +120,36 @@ class GANSATSolver:
         if gan_result == RESULT_SAT:
             return gan_result, gan_model, (time.time() - t0) * 1000
 
-        # GAN missed — wait for portfolio result
-        timeout_remaining = max(self.timeout_ms / 1000.0 - (time.time() - t0) + 2.0, 2.0)
-        try:
-            _, result, model = result_q.get(timeout=timeout_remaining)
-        except queue.Empty:
-            result, model = RESULT_UNKNOWN, None
+        # ── GAN missed: Z3 on main thread + check if Bitwuzla already done ───
+        elapsed_ms   = int((time.time() - t0) * 1000)
+        remaining_ms = max(self.timeout_ms - elapsed_ms, 1000)
 
-        return result, model, (time.time() - t0) * 1000
+        # Check if Bitwuzla already finished while GAN was running
+        if self.portfolio and logic in _BV_LOGICS:
+            try:
+                r, m = bwz_q.get_nowait()
+                if r in (RESULT_SAT, RESULT_UNSAT):
+                    return r, m, (time.time() - t0) * 1000
+            except queue.Empty:
+                pass
+
+        # Run Z3 on main thread
+        z3_result, z3_model = self._z3_solve(formula, logic, remaining_ms)
+        elapsed_ms = int((time.time() - t0) * 1000)
+
+        if z3_result in (RESULT_SAT, RESULT_UNSAT):
+            return z3_result, z3_model, elapsed_ms
+
+        # Both GAN and Z3 failed — wait for Bitwuzla if BV
+        if self.portfolio and logic in _BV_LOGICS:
+            bwz_wait = max(self.timeout_ms / 1000.0 - (time.time() - t0) + 1.0, 1.0)
+            try:
+                r, m = bwz_q.get(timeout=bwz_wait)
+                return r, m, (time.time() - t0) * 1000
+            except queue.Empty:
+                pass
+
+        return RESULT_UNKNOWN, None, (time.time() - t0) * 1000
 
     # ── GAN fast paths ────────────────────────────────────────────────────────
 
