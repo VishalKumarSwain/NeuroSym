@@ -1,0 +1,27 @@
+# Training / benchmark data — too large for image
+data/
+
+# Training scripts and evaluation — not needed at runtime
+scripts/
+
+# Trained model checkpoints managed by .gitignore too
+models/*.npy
+
+# Git history
+.git/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Dev / docs
+*.md
+*.log
+*.tmp
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
