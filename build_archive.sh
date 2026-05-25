@@ -31,7 +31,8 @@ pip install --target ./lib --no-compile \
     "z3-solver>=4.12.0" \
     "bitwuzla>=0.9.0" \
     "networkx>=3.1" \
-    "pysmt>=0.9.5"
+    "pysmt>=0.9.5" \
+    "numpy>=1.24.0"
 
 # Strip runtime-irrelevant bulk to keep the archive small
 find lib/ -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
