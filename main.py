@@ -14,12 +14,19 @@ Usage (SMT-COMP harness):
 
 import sys
 import os
-import argparse
-
-sys.setrecursionlimit(100000)
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
+
+# Bootstrap bundled dependencies — competition environment (Ubuntu 24.04) does not
+# have z3-solver, bitwuzla, networkx, or pysmt; lib/ is pre-installed by build_archive.sh
+_LIB = os.path.join(_ROOT, "lib")
+if os.path.isdir(_LIB) and _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+sys.setrecursionlimit(100000)
+
+import argparse
 
 from gansat.solver import GANSATSolver, format_output, RESULT_SAT, RESULT_UNSAT
 
