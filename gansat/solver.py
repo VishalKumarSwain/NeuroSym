@@ -1,15 +1,14 @@
 """
-GANSAT solver — Neural-Symbolic Portfolio Solver.
+GANSAT solver — Neural-Symbolic SMT Solver.
 
 Strategy:
   1. GAN fast path  (~5ms)  — predicts satisfying assignment directly
-  2. If GAN misses  → race Z3 vs Bitwuzla in parallel threads
-  3. Whoever answers first wins; other thread is cancelled via timeout
+  2. If GAN misses:
+       QF_BV / QF_ABV → Bitwuzla only  (single SMT solver; started in
+                         background at t=0 so it runs during GAN inference)
+       QF_LIA / other → Z3 only
 
-Theories:
-  QF_LIA → GAN (LIA) + Z3 parallel
-  QF_BV  → GAN (BV)  + Z3 + Bitwuzla parallel   ← portfolio
-  Other  → Z3 only
+Single SMT solver per logic — not a portfolio solver.
 """
 
 import time
@@ -99,32 +98,25 @@ class GANSATSolver:
     def _solve(self, formula: ParsedFormula) -> tuple:
         t0    = time.time()
         logic = formula.logic.upper()
+        is_bv = logic in _BV_LOGICS
 
-        # ── Strategy ──────────────────────────────────────────────────────────
-        # Z3 is NOT thread-safe across threads. So:
-        #   • Bitwuzla (C++ library, own memory) → background thread from t=0
-        #   • GAN verification (uses Z3) + Z3 fallback → main thread only
-        # This gives Bitwuzla a head-start while the GAN runs, eliminating
-        # the sequential penalty without any Z3 thread-safety issues.
-
+        # For BV: start Bitwuzla in background immediately so it runs
+        # concurrently with the GAN inference, giving it a head start.
         bwz_q = queue.Queue()
-
-        def _run_bitwuzla():
-            try:
-                r, m = self._bitwuzla_solve(formula.source, self.timeout_ms)
-                bwz_q.put((r, m))
-            except Exception:
-                bwz_q.put((RESULT_UNKNOWN, None))
-
-        # Start Bitwuzla immediately in background (BV only)
-        if self.portfolio and logic in _BV_LOGICS:
+        if is_bv and self.portfolio:
+            def _run_bitwuzla():
+                try:
+                    r, m = self._bitwuzla_solve(formula.source, self.timeout_ms)
+                    bwz_q.put((r, m))
+                except Exception:
+                    bwz_q.put((RESULT_UNKNOWN, None))
             threading.Thread(target=_run_bitwuzla, daemon=True).start()
 
-        # ── GAN fast path (main thread — Z3 verification here is safe) ───────
+        # ── GAN fast path ─────────────────────────────────────────────────────
         gan_result, gan_model = RESULT_UNKNOWN, None
         if _TORCH_AVAILABLE:
             try:
-                if logic in _BV_LOGICS:
+                if is_bv:
                     gan_result, gan_model = self._bv_fast_path(formula)
                 elif logic in _LIA_LOGICS or formula.variables:
                     gan_result, gan_model = self._lia_fast_path(formula)
@@ -134,50 +126,22 @@ class GANSATSolver:
         if gan_result == RESULT_SAT:
             return gan_result, gan_model, (time.time() - t0) * 1000
 
-        # ── GAN missed: Z3 on main thread + check if Bitwuzla already done ───
+        # ── GAN missed: single symbolic fallback ──────────────────────────────
         elapsed_ms   = int((time.time() - t0) * 1000)
         remaining_ms = max(self.timeout_ms - elapsed_ms, 1000)
 
-        # Check if Bitwuzla already finished while GAN was running
-        if self.portfolio and logic in _BV_LOGICS:
-            try:
-                r, m = bwz_q.get_nowait()
-                if r in (RESULT_SAT, RESULT_UNSAT):
-                    return r, m, (time.time() - t0) * 1000
-            except queue.Empty:
-                pass
-
-        # Bitwuzla intermediate wait: give Bitwuzla up to 1.5s before committing
-        # Z3 to the full remaining timeout. This catches the common case where
-        # Bitwuzla answers in ~500-1500ms while Z3 would waste 4-5s and miss it.
-        if self.portfolio and logic in _BV_LOGICS:
-            bwz_pre = min(1.5, remaining_ms / 1000.0 * 0.3)
-            try:
-                r, m = bwz_q.get(timeout=bwz_pre)
-                if r in (RESULT_SAT, RESULT_UNSAT):
-                    return r, m, (time.time() - t0) * 1000
-            except queue.Empty:
-                pass
-            elapsed_ms   = int((time.time() - t0) * 1000)
-            remaining_ms = max(self.timeout_ms - elapsed_ms, 500)
-
-        # Run Z3 on main thread
-        z3_result, z3_model = self._z3_solve(formula, logic, remaining_ms)
-        elapsed_ms = int((time.time() - t0) * 1000)
-
-        if z3_result in (RESULT_SAT, RESULT_UNSAT):
-            return z3_result, z3_model, elapsed_ms
-
-        # Both GAN and Z3 failed — wait for Bitwuzla if BV
-        if self.portfolio and logic in _BV_LOGICS:
+        if is_bv and self.portfolio:
+            # BV: Bitwuzla only — one SMT solver, no portfolio
             bwz_wait = max(self.timeout_ms / 1000.0 - (time.time() - t0) + 1.0, 1.0)
             try:
                 r, m = bwz_q.get(timeout=bwz_wait)
                 return r, m, (time.time() - t0) * 1000
             except queue.Empty:
-                pass
+                return RESULT_UNKNOWN, None, (time.time() - t0) * 1000
 
-        return RESULT_UNKNOWN, None, (time.time() - t0) * 1000
+        # Non-BV (or BV without Bitwuzla available): Z3
+        z3_result, z3_model = self._z3_solve(formula, logic, remaining_ms)
+        return z3_result, z3_model, (time.time() - t0) * 1000
 
     # ── GAN fast paths ────────────────────────────────────────────────────────
 
@@ -204,50 +168,6 @@ class GANSATSolver:
             if _verify_assignment(formula, assignment, theory="bv"):
                 return RESULT_SAT, assignment
         return RESULT_UNKNOWN, None
-
-    # ── Portfolio: Z3 vs Bitwuzla race ────────────────────────────────────────
-
-    def _portfolio_solve(self, formula: ParsedFormula, logic: str,
-                         timeout_ms: int) -> tuple:
-        """Race Z3 and Bitwuzla — return whichever answers first."""
-        result_q  = queue.Queue()
-        timeout_s = timeout_ms / 1000.0
-
-        def _run_z3():
-            try:
-                r, m = self._z3_solve(formula, logic, timeout_ms)
-                result_q.put(("z3", r, m))
-            except Exception:
-                result_q.put(("z3", RESULT_UNKNOWN, None))
-
-        def _run_bitwuzla():
-            try:
-                r, m = self._bitwuzla_solve(formula.source, timeout_ms)
-                result_q.put(("bitwuzla", r, m))
-            except Exception:
-                result_q.put(("bitwuzla", RESULT_UNKNOWN, None))
-
-        t_z3  = threading.Thread(target=_run_z3,       daemon=True)
-        t_bwz = threading.Thread(target=_run_bitwuzla, daemon=True)
-        t_z3.start()
-        t_bwz.start()
-
-        deadline = time.time() + timeout_s + 2.0
-        best = (RESULT_UNKNOWN, None)
-        answered = 0
-
-        while answered < 2 and time.time() < deadline:
-            try:
-                who, r, m = result_q.get(timeout=0.1)
-                answered += 1
-                if r in (RESULT_SAT, RESULT_UNSAT):
-                    return r, m
-                if r != RESULT_UNKNOWN:
-                    best = (r, m)
-            except queue.Empty:
-                continue
-
-        return best
 
     # ── Z3 solver ─────────────────────────────────────────────────────────────
 
