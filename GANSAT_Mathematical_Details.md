@@ -5,6 +5,62 @@ SMT-COMP 2026 — QF_LIA / QF_BV / QF_ABV
 
 ---
 
+## Architecture Overview
+
+### Solving Pipeline
+
+```mermaid
+flowchart TD
+    A([SMT Formula f]) --> B[Encoder]
+    B --> C[GAN Generator\n8 candidates]
+    C --> D{Z3 Verify\neach candidate}
+    D -->|hit| E([sat ✓  ~3–15 ms])
+    D -->|all miss| F{Logic?}
+    F -->|QF_BV / QF_ABV| G[Bitwuzla\nfallback]
+    F -->|QF_LIA| H[Z3\nfallback]
+    G --> I([Result])
+    H --> I
+```
+
+### GAN Generator — Iterative Refinement
+
+```mermaid
+flowchart TD
+    F([f ∈ ℝ^8576]) --> IG
+    Z([z ~ N_0_I_128]) --> IG
+    IG[InitialGuesser\nW_in → 4× ResBlock → tanh] --> X0([x̂⁽⁰⁾ ∈ −1_1^64])
+
+    X0 --> VC0[ViolationComputer]
+    F  --> VC0
+    VC0 --> VC0out([v^C ∈ ℝ^128\nv^V ∈ ℝ^64])
+
+    VC0out --> RS[RefinementStep\nW_in → 3× ResBlock → tanh ⊙ s]
+    X0     --> RS
+    F      --> RS
+    RS --> Delta([Δ⁽ᵏ⁾])
+    Delta --> CLIP[clip x̂⁽ᵏ⁾ + Δ⁽ᵏ⁾]
+    CLIP --> Xk([x̂⁽ᵏ⁺¹⁾])
+
+    Xk -->|repeat K=3 rounds| VC0
+    Xk --> OUT([x̂⁽³⁾ → decode → x* ∈ ℤⁿ])
+```
+
+### Training Loop
+
+```mermaid
+flowchart LR
+    D1([Real pair\nf, x*]) --> DISC[Discriminator D_φ]
+    G1([Generator G_θ\nf, z]) --> DISC
+    DISC --> LD([L_D = BCE real + BCE fake])
+    LD -->|∇φ| DISC
+
+    G1 --> VIO[ViolationComputer]
+    VIO --> LG([L_G = L_adv + 0.5 · L_viol])
+    LG -->|∇θ| G1
+```
+
+---
+
 ## 1. Problem Formulation
 
 ### 1.1 SMT Satisfiability (QF_LIA)
@@ -156,6 +212,28 @@ $$\mathbf{v}^C_{(k)},\;\mathbf{v}^V_{(k)} = \text{ViolationComputer}(\mathbf{f},
 $$\hat{\mathbf{x}}^{(k+1)} = \text{RefinementStep}\!\left(\mathbf{f},\;\hat{\mathbf{x}}^{(k)},\;\mathbf{v}^C_{(k)},\;\mathbf{v}^V_{(k)}\right)$$
 
 **Output:** $\hat{\mathbf{x}}^{(3)} \in [-1,1]^{64}$
+
+```mermaid
+flowchart LR
+    F([f]) --> IG[InitialGuesser]
+    Z([z ~ N]) --> IG
+    IG -->|x̂⁽⁰⁾| VC0[ViolationComputer\nk=0]
+    F --> VC0
+    VC0 -->|v^C, v^V| RS0[RefinementStep\nk=0]
+    IG -->|x̂⁽⁰⁾| RS0
+    F --> RS0
+    RS0 -->|x̂⁽¹⁾| VC1[ViolationComputer\nk=1]
+    F --> VC1
+    VC1 -->|v^C, v^V| RS1[RefinementStep\nk=1]
+    RS0 -->|x̂⁽¹⁾| RS1
+    F --> RS1
+    RS1 -->|x̂⁽²⁾| VC2[ViolationComputer\nk=2]
+    F --> VC2
+    VC2 -->|v^C, v^V| RS2[RefinementStep\nk=2]
+    RS1 -->|x̂⁽²⁾| RS2
+    F --> RS2
+    RS2 -->|x̂⁽³⁾| OUT([Output x̂⁽³⁾])
+```
 
 ---
 
