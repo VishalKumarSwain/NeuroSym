@@ -357,7 +357,7 @@ This prevents vanishing/exploding gradients across refinement rounds.
 
 ### 11.1 Best-of-N Sampling
 
-Generate $N=16$ candidates with different noise seeds:
+Generate $N=8$ candidates with different noise seeds:
 
 $$\hat{\mathbf{x}}^{(K)}_1, \ldots, \hat{\mathbf{x}}^{(K)}_N = G_\theta(\mathbf{f},\, \mathbf{z}_1), \ldots, G_\theta(\mathbf{f},\, \mathbf{z}_N), \qquad \mathbf{z}_i \sim \mathcal{N}(0, I)$$
 
@@ -375,11 +375,11 @@ $$\text{verify}(\mathbf{x}^*_i) = \bigwedge_{c=1}^m \text{z3.simplify}\!\Big(C_c
 
 ### 11.3 Decision Procedure
 
-$$\text{result} = \begin{cases} \text{sat},\; \mathbf{x}^*_i & \exists\, i : \text{verify}(\mathbf{x}^*_i) = \top \quad \text{(fast path, ~2ms)} \\ \text{Z3 full solve} & \text{otherwise} \quad \text{(fallback, complete)} \end{cases}$$
+$$\text{result} = \begin{cases} \text{sat},\; \mathbf{x}^*_i & \exists\, i : \text{verify}(\mathbf{x}^*_i) = \top \quad \text{(fast path, ~2ms)} \\ \text{Bitwuzla} & \text{QF\_BV / QF\_ABV fallback (complete)} \\ \text{Z3 full solve} & \text{QF\_LIA fallback (complete)} \end{cases}$$
 
 **Soundness:** Z3 verification is exact — no false positives.
 
-**Completeness:** Z3 fallback is always run if no candidate passes — GANSAT never returns `unknown` when Z3 returns `sat` or `unsat`.
+**Completeness:** A single symbolic fallback (Bitwuzla for BV, Z3 for LIA) is always run if no GAN candidate passes — GANSAT never returns `unknown` when the fallback solver returns `sat` or `unsat`.
 
 ---
 
@@ -387,12 +387,12 @@ $$\text{result} = \begin{cases} \text{sat},\; \mathbf{x}^*_i & \exists\, i : \te
 
 | Module | Parameters |
 |---|---|
-| InitialGuesser | $\approx 4.7M$ |
+| InitialGuesser | $\approx 6.6M$ |
 | RefinementStep (×1, shared) | $\approx 2.5M$ |
 | ViolationComputer | $0$ (parameter-free) |
 | Discriminator | $\approx 4.9M$ |
-| **Generator total** | $\approx 7.2M$ |
-| **Full model total** | $\approx 12.1M$ |
+| **Generator total** | $\approx 9.1M$ |
+| **Full model total** | $\approx 14.0M$ |
 
 Calculation for InitialGuesser:
 $$W_{\text{in}}: 8704 \times 512 = 4.5M, \quad 4 \times \text{ResBlock}: 4 \times 2 \times 512^2 \approx 2.1M, \quad W_{\text{out}}: 512 \times 64 = 32K$$
@@ -451,4 +451,4 @@ For formula families where the GAN fast path succeeds often (similar distributio
 
 *Document: GANSAT Mathematical Details*
 *University of Manchester — PhD Software Testing*
-*SMT-COMP '26, QF_LIA Track*
+*SMT-COMP '26, QF_LIA / QF_BV / QF_ABV Tracks*
