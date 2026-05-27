@@ -74,7 +74,8 @@
 \textbf{Abstract.}
 NeuroSym is the \textbf{first GAN-guided solver} submitted to SMT-COMP.
 It pairs an Iterative Refinement GAN (8 candidates per formula) with a
-Z3\,+\,Bitwuzla portfolio fallback.
+single symbolic fallback per theory: Bitwuzla for QF\_BV/QF\_ABV and
+Z3 for QF\_LIA.
 On 100 SMT-COMP 2025 QF\_BV benchmarks (5\,s timeout),
 NeuroSym achieves a PAR-2 score of \textbf{949.0\,ms} — only 10\,ms
 behind Bitwuzla (2024 winner, 938.9\,ms) — while solving \emph{one more}
@@ -88,10 +89,10 @@ NeuroSym combines three complementary components:
   \item \textbf{GAN fast path} — predicts satisfying assignments directly
         from the formula encoding; each candidate is Z3-verified before
         returning \texttt{sat} (no false positives possible).
-  \item \textbf{Bitwuzla} (background thread, starts at $t{=}0$) —
-        C++ BV-specialist solver; runs concurrently with the GAN.
-  \item \textbf{Z3} (main thread, fallback) — guarantees completeness
-        for UNSAT and hard SAT cases.
+  \item \textbf{Bitwuzla} (QF\_BV/QF\_ABV fallback, background at $t{=}0$) —
+        C++ BV-specialist; starts concurrently with the GAN inference.
+  \item \textbf{Z3} (QF\_LIA fallback + GAN verifier) — guarantees
+        completeness for LIA; verifies all GAN candidates.
 \end{itemize}
 
 \subsection*{Solving Pipeline}
@@ -107,23 +108,20 @@ NeuroSym combines three complementary components:
   \node[box, fill=blue!10]   (gan)  at (0,-0.7)  {GAN (8 candidates)};
   \node[box, fill=green!15]  (ver)  at (0,-1.4)  {Z3 Verify};
   \node[box, fill=green!30]  (sat)  at (3.2,-1.4){\textcolor{satcolor}{\textbf{SAT}} $\sim$3--15\,ms};
-  \node[box, fill=orange!15] (bwz)  at (0,-2.1)  {Bitwuzla (background)};
-  \node[box, fill=orange!10] (z3f)  at (0,-2.8)  {Z3 fallback (main)};
-  \node[box, fill=gray!15]   (res)  at (3.2,-2.8){Result};
+  \node[box, fill=orange!15] (bwz)  at (0,-2.1)  {Bitwuzla (BV) / Z3 (LIA)};
+  \node[box, fill=gray!15]   (res)  at (3.2,-2.1){Result};
   \draw[arr] (enc) -- (gan);
   \draw[arr] (gan) -- (ver);
   \draw[arr] (ver) -- node[above, font=\tiny]{hit}  (sat);
   \draw[arr] (ver) -- node[left,  font=\tiny]{miss} (bwz);
-  \draw[arr] (bwz) -- (z3f);
-  \draw[arr] (z3f) -- (res);
-  \draw[arr] (bwz.east) -- (3.2,-2.1) -- (res.north);
+  \draw[arr] (bwz) -- (res);
 \end{tikzpicture}
 \end{center}
 
-\noindent A key optimization: after a GAN miss, NeuroSym waits up to
-\textbf{1.5\,s} for Bitwuzla \emph{before} committing to Z3's full timeout.
-This eliminates cases where Z3 blocks for $\sim$5\,s while Bitwuzla already
-holds the answer.
+\noindent For BV problems, Bitwuzla starts in a background thread at
+$t{=}0$ while the GAN runs. After a GAN miss, the remaining timeout
+goes entirely to Bitwuzla. For LIA problems, Z3 is the symbolic fallback.
+Each logic uses exactly one SMT solver as fallback.
 
 % ─── 2. TRAINING ─────────────────────────────────────────────────────────────
 \section{Training}
@@ -215,8 +213,8 @@ a $<$1.1\% gap.
 scrambled212516 & timeout & \textbf{3\,ms}  & $>$1000$\times$ & GAN hit \\
 scrambled143406 & timeout & \textbf{3\,ms}  & $>$1000$\times$ & GAN hit \\
 scrambled106187 & timeout &  68\,ms & $>$100$\times$ & GAN fast path \\
-scrambled19920  & timeout & solved  & rescued & Portfolio \\
-scrambled293734 & timeout & solved  & rescued & Portfolio \\
+scrambled19920  & timeout & solved  & rescued & Bitwuzla \\
+scrambled293734 & timeout & solved  & rescued & Bitwuzla \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -260,11 +258,11 @@ NeuroSym demonstrates that GAN-guided SMT solving is both \emph{correct}
 and \emph{competitive}:
 
 \begin{itemize}
-  \item \textbf{Correctness:} Zero wrong answers — Z3/Bitwuzla fallback
-        guarantees completeness; GAN can only claim \texttt{sat} with a
-        verified witness.
+  \item \textbf{Correctness:} Zero wrong answers — Bitwuzla fallback (BV)
+        and Z3 fallback (LIA) guarantee completeness; GAN can only claim
+        \texttt{sat} with a verified witness.
   \item \textbf{Speed:} $>$1000$\times$ speedup on GAN direct-hit
-        benchmarks; 26 Z3-timeout rescues.
+        benchmarks; 26 Bitwuzla rescues on Z3-timeout cases.
   \item \textbf{PAR-2:} 949\,ms vs.\ Bitwuzla 939\,ms — within 1.1\%
         of the 2024 competition winner.
   \item \textbf{Coverage:} Solves 91 benchmarks vs.\ Bitwuzla's 90.
