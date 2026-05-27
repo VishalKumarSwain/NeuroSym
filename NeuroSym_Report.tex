@@ -257,7 +257,30 @@ Its advantage is strongest on SAT-heavy formula classes where satisfying
 assignments follow learnable patterns (e.g., path constraints from
 symbolic execution, bounded arithmetic).
 
-% ─── 5. CONCLUSION ───────────────────────────────────────────────────────────
+% ─── 5. USAGE ────────────────────────────────────────────────────────────────
+\section{Running NeuroSym}
+
+NeuroSym follows the standard SMT-COMP single-query interface.
+The solver receives one benchmark file as a command-line argument and
+writes \texttt{sat}, \texttt{unsat}, or \texttt{unknown} to stdout.
+
+\begin{verbatim}
+# Single benchmark
+NeuroSym-1.1/python3 benchmark.smt2
+
+# With explicit timeout (seconds)
+NeuroSym-1.1/python3 --timeout 20 benchmark.smt2
+\end{verbatim}
+
+\noindent\textbf{Dependencies} (bundled in \texttt{lib/}):
+z3-solver\,$\geq$\,4.12, bitwuzla\,$\geq$\,0.9, numpy\,$\geq$\,1.24,
+networkx\,$\geq$\,3.1, pysmt\,$\geq$\,0.9.5.
+PyTorch is \emph{optional}; without it the solver runs the symbolic
+fallback only (Bitwuzla for BV, Z3 for LIA).
+
+\noindent\textbf{Supported logics:} QF\_LIA, QF\_BV, QF\_ABV.
+
+% ─── 6. CONCLUSION ───────────────────────────────────────────────────────────
 \section{Conclusion}
 
 NeuroSym demonstrates that GAN-guided SMT solving is both \emph{correct}
