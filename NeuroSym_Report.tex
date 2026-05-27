@@ -84,7 +84,7 @@ single symbolic fallback per theory: Bitwuzla for QF\_BV/QF\_ABV and
 Z3 for QF\_LIA.
 On 100 SMT-COMP 2025 QF\_BV benchmarks (5\,s timeout),
 NeuroSym achieves a PAR-2 score of \textbf{949.0\,ms} — only 10\,ms
-behind Bitwuzla (2024 winner, 938.9\,ms) — while solving \emph{one more}
+behind Bitwuzla (2024--2025 winner, 938.9\,ms) — while solving \emph{one more}
 benchmark (91 vs.\ 90) with \textbf{zero wrong answers}.
 
 % ─── 1. SYSTEM OVERVIEW ──────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ $$
 \midrule
 \textbf{NeuroSym} & \textbf{91} & \textbf{9}
   & \textbf{949.0\,ms} & \textbf{0} \\
-Bitwuzla (2024 winner) & 90 & 10 & 938.9\,ms & — \\
+Bitwuzla (2024--2025 winner) & 90 & 10 & 938.9\,ms & — \\
 Z3                     & 66 & 34 &  3{,}192\,ms$^*$ & — \\
 \bottomrule
 \multicolumn{5}{@{}l@{}}{\footnotesize $^*$Z3 times include $\sim$1.9\,s subprocess overhead (crash isolation).}
@@ -270,7 +270,7 @@ and \emph{competitive}:
   \item \textbf{Speed:} $>$1000$\times$ speedup on GAN direct-hit
         benchmarks; 26 Bitwuzla rescues on Z3-timeout cases.
   \item \textbf{PAR-2:} 949\,ms vs.\ Bitwuzla 939\,ms — within 1.1\%
-        of the 2024 competition winner.
+        of the 2024--2025 competition winner.
   \item \textbf{Coverage:} Solves 91 benchmarks vs.\ Bitwuzla's 90.
 \end{itemize}
 
