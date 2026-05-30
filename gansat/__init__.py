@@ -1,6 +1,6 @@
-from .solver     import GANSATSolver
-from .encoder    import encode, decode_assignment
-from .bv_encoder import bv_encode, bv_decode_assignment, bv_feature_dim
+from .ns_solver   import NeuroSymSolver, format_output
+from .ns_encoder  import encode, decode_assignment
+from .ns_bv_encoder import bv_encode, bv_decode_assignment, bv_feature_dim
 
 # GAN modules require PyTorch — import only when available
 try:

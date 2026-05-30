@@ -28,7 +28,7 @@ sys.setrecursionlimit(100000)
 
 import argparse
 
-from gansat.solver import GANSATSolver, format_output, RESULT_SAT, RESULT_UNSAT
+from gansat.ns_solver import NeuroSymSolver, format_output, RESULT_SAT, RESULT_UNSAT
 
 
 def main():
@@ -47,7 +47,7 @@ def main():
     lia_model_path = args.lia_model if os.path.exists(args.lia_model) else None
     model_path     = args.model     if os.path.exists(args.model)     else None
 
-    solver = GANSATSolver(
+    solver = NeuroSymSolver(
         model_path=model_path,
         bv_model_path=bv_model_path,
         lia_model_path=lia_model_path,
