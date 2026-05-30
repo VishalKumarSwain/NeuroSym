@@ -241,21 +241,18 @@ def _fm_feasible(constraints: List[LinConstraint],
                 lower.append((rhs, rest, -c_var, 'lower'))
 
         # Generate FM resolvents: (lower_i, upper_j) → new constraint
+        # Lower: -l_c*x + sum(l_rest*v) <= l_rhs  →  x >= (sum(l_rest*v) - l_rhs) / l_c
+        # Upper:  u_c*x + sum(u_rest*v) <= u_rhs  →  x <= (u_rhs - sum(u_rest*v)) / u_c
+        # Scale lower by u_c and upper by l_c, add — x cancels:
+        #   u_c*sum(l_rest*v) + l_c*sum(u_rest*v) <= u_c*l_rhs + l_c*u_rhs
         for (l_rhs, l_rest, l_c, _) in lower:
             for (u_rhs, u_rest, u_c, _) in upper:
-                # lb <= var <= ub: lb <= ub (after combining)
-                # u_c * var <= u_rhs - sum(u_rest)
-                # var >= l_rhs/l_c - sum(l_rest)/l_c
-                # Combined: l_rhs/l_c <= u_rhs/u_c (approximately)
-                # Exact FM: multiply out to clear denominators
-                # l_c * u_c constraint: u_c * l_rhs - l_c * sum(u_rest) <=
-                #                       l_c * u_rhs - u_c * sum(l_rest)
                 new_coeffs: Dict[str, Fraction] = {}
-                for v, cv in u_rest.items():
-                    new_coeffs[v] = new_coeffs.get(v, Fraction(0)) - l_c * cv
                 for v, cv in l_rest.items():
                     new_coeffs[v] = new_coeffs.get(v, Fraction(0)) + u_c * cv
-                new_rhs = l_c * u_rhs - u_c * l_rhs
+                for v, cv in u_rest.items():
+                    new_coeffs[v] = new_coeffs.get(v, Fraction(0)) + l_c * cv
+                new_rhs = u_c * l_rhs + l_c * u_rhs
                 if new_coeffs:
                     new_ineqs.append((new_coeffs, new_rhs))
                 else:
@@ -294,7 +291,8 @@ def _solve_integer(constraints: List[LinConstraint],
                 if coef > 0:
                     ub = min(ub, int(math.floor(float(rhs / coef))))
                 elif coef < 0:
-                    lb = max(lb, int(math.ceil(float(rhs / -coef))))
+                    # coef*x <= rhs, coef<0 → x >= rhs/coef (flip inequality)
+                    lb = max(lb, int(math.ceil(float(rhs / coef))))
             elif c.op == '=':
                 if coef != 0:
                     exact = rhs / coef
@@ -336,6 +334,11 @@ def _solve_integer(constraints: List[LinConstraint],
             if var not in c.coeffs:
                 continue
             c_var = c.coeffs[var]
+            other_vars = [v for v in c.coeffs if v != var]
+            # Only tighten bounds when all other variables in this constraint
+            # are already assigned; otherwise adjusted_rhs is meaningless.
+            if not all(v in partial for v in other_vars):
+                continue
             rest_val = sum(c.coeffs.get(v, Fraction(0)) * Fraction(partial[v])
                            for v in c.coeffs if v != var and v in partial)
             adjusted_rhs = c.rhs - rest_val
@@ -343,7 +346,7 @@ def _solve_integer(constraints: List[LinConstraint],
                 if c_var > 0:
                     ub = min(ub, int(math.floor(float(adjusted_rhs / c_var))))
                 elif c_var < 0:
-                    lb = max(lb, int(math.ceil(float(adjusted_rhs / -c_var))))
+                    lb = max(lb, int(math.ceil(float(adjusted_rhs / c_var))))
             elif c.op == '=':
                 if c_var != 0:
                     exact = adjusted_rhs / c_var
@@ -363,12 +366,15 @@ def _solve_integer(constraints: List[LinConstraint],
         # Heuristic: try 0 first, then midpoint, then edges
         candidates = sorted(range(lb, ub + 1),
                              key=lambda x: (abs(x), x < 0))
-        # Limit candidates
-        if len(candidates) > 200:
-            step = max(1, len(candidates) // 100)
-            candidates = candidates[::step]
-            if ub not in candidates: candidates.append(ub)
-            if lb not in candidates: candidates.append(lb)
+        # Limit candidates while keeping dense coverage near 0 and bounds
+        if len(candidates) > 500:
+            step = max(1, len(candidates) // 200)
+            sampled = set(candidates[::step])
+            # Always include lb, ub, and values close to 0
+            for v in range(lb, min(lb + 20, ub + 1)): sampled.add(v)
+            for v in range(max(ub - 20, lb), ub + 1):  sampled.add(v)
+            for v in range(max(lb, -20), min(ub + 1, 21)): sampled.add(v)
+            candidates = sorted(sampled, key=lambda x: (abs(x), x < 0))
 
         for val in reversed(candidates):   # reversed so stack pops try low first
             new_partial = dict(partial)
