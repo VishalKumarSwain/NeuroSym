@@ -55,13 +55,13 @@ def main():
             timeout_ms    = timeout_ms,
             device        = device,
         )
-        result, model, elapsed_ms = solver.solve_string(smtlib_input)
+        result, model, elapsed_ms, formula = solver.solve_string(smtlib_input)
     except Exception as e:
         sys.stderr.write(f"[gansat_bridge] error: {e}\n")
         print("unknown", flush=True)
         sys.exit(1)
 
-    print(format_output(result, model), flush=True)
+    print(format_output(result, model, formula.variables), flush=True)
     sys.exit(0 if result in (RESULT_SAT, RESULT_UNSAT) else 1)
 
 

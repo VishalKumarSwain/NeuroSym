@@ -77,13 +77,17 @@ class NeuroSymSolver:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def solve_file(self, path: str) -> Tuple[str, Optional[dict], float]:
+    def solve_file(self, path: str) -> Tuple[str, Optional[dict], float, NsFormula]:
         formula = parse_file(path)
-        return self._solve(formula)
+        result, model, elapsed_ms = self._solve(formula)
+        return result, model, elapsed_ms, formula
 
-    def solve_string(self, smtlib_str: str) -> Tuple[str, Optional[dict], float]:
+    def solve_string(
+        self, smtlib_str: str
+    ) -> Tuple[str, Optional[dict], float, NsFormula]:
         formula = parse_string(smtlib_str)
-        return self._solve(formula)
+        result, model, elapsed_ms = self._solve(formula)
+        return result, model, elapsed_ms, formula
 
     # ── Internal dispatch ─────────────────────────────────────────────────────
 
@@ -197,11 +201,30 @@ class NeuroSymSolver:
 
 # ── Output formatting ─────────────────────────────────────────────────────────
 
-def format_output(result: str, model: Optional[dict] = None) -> str:
+def format_output(
+    result: str,
+    model: Optional[dict] = None,
+    variables: Optional[dict] = None,
+) -> str:
+    """`variables` is NsFormula.variables (name -> Var); when a name resolves
+    to a BVSort, the value is emitted as a sized BV literal
+    ("(_ BitVec N) #xHH...") rather than Int, matching what
+    GANSATSolverImpl::parseModel (gansat_solver.cpp) parses back on the KLEE
+    side. Without sort info (or for non-BV variables) it falls back to Int."""
     lines = [result]
     if result == RESULT_SAT and model:
         lines.append("(model")
         for name, val in sorted(model.items()):
-            lines.append(f"  (define-fun {name} () Int {val})")
+            var = variables.get(name) if variables else None
+            if var is not None and isinstance(var.sort, BVSort):
+                width = var.sort.width
+                hex_digits = (width + 3) // 4
+                hex_val = val & ((1 << width) - 1)
+                lines.append(
+                    f"  (define-fun {name} () (_ BitVec {width}) "
+                    f"#x{hex_val:0{hex_digits}x})"
+                )
+            else:
+                lines.append(f"  (define-fun {name} () Int {val})")
         lines.append(")")
     return "\n".join(lines)

@@ -87,11 +87,13 @@ class GANSATSolver:
 
     def solve_file(self, path: str) -> tuple:
         formula = parse_file(path)
-        return self._solve(formula)
+        result, model, elapsed_ms = self._solve(formula)
+        return result, model, elapsed_ms, formula
 
     def solve_string(self, smtlib_str: str) -> tuple:
         formula = parse_string(smtlib_str)
-        return self._solve(formula)
+        result, model, elapsed_ms = self._solve(formula)
+        return result, model, elapsed_ms, formula
 
     # ── Internal dispatch ─────────────────────────────────────────────────────
 
@@ -253,11 +255,26 @@ def _extract_model(model: z3.ModelRef, logic: str) -> dict:
 
 # ── Output formatting ────────────────────────────────────────────────────────
 
-def format_output(result: str, model: dict = None) -> str:
+def format_output(result: str, model: dict = None, variables: dict = None) -> str:
+    """`variables` is the ParsedFormula.variables map (name -> Z3 const); when a
+    name resolves to a bit-vector sort, the value is emitted as a sized BV
+    literal ("(_ BitVec N) #xHH...") rather than Int, matching what
+    GANSATSolverImpl::parseModel (gansat_solver.cpp) parses back on the KLEE
+    side. Without sort info (or for non-BV variables) it falls back to Int."""
     lines = [result]
     if result == RESULT_SAT and model:
         lines.append("(model")
         for name, val in sorted(model.items()):
-            lines.append(f"  (define-fun {name} () Int {val})")
+            var = variables.get(name) if variables else None
+            if var is not None and z3.is_bv_sort(var.sort()):
+                width = var.sort().size()
+                hex_digits = (width + 3) // 4
+                hex_val = val & ((1 << width) - 1)
+                lines.append(
+                    f"  (define-fun {name} () (_ BitVec {width}) "
+                    f"#x{hex_val:0{hex_digits}x})"
+                )
+            else:
+                lines.append(f"  (define-fun {name} () Int {val})")
         lines.append(")")
     return "\n".join(lines)

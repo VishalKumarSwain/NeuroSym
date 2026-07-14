@@ -59,14 +59,14 @@ def main():
     try:
         if args.stdin or args.input_file is None:
             smtlib_str = sys.stdin.read()
-            result, model, _ = solver.solve_string(smtlib_str)
+            result, model, _, formula = solver.solve_string(smtlib_str)
         else:
-            result, model, _ = solver.solve_file(args.input_file)
+            result, model, _, formula = solver.solve_file(args.input_file)
     except Exception as e:
         print("unknown", flush=True)
         sys.exit(1)
 
-    print(format_output(result, model), flush=True)
+    print(format_output(result, model, formula.variables), flush=True)
     sys.exit(0 if result in (RESULT_SAT, RESULT_UNSAT) else 1)
 
 
