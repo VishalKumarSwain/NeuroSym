@@ -17,17 +17,41 @@ from typing import Optional, Tuple
 from .ns_parser    import parse_file, parse_string
 from .ns_ast       import NsFormula, BVSort, IntSort
 from .ns_evaluator import evaluate
-from .ns_encoder   import encode, decode_assignment
-from .ns_bv_encoder import bv_encode, bv_decode_assignment
 
-# PyTorch and trained GAN models are optional
-try:
-    import torch
-    from .gan    import IterativeGenerator,   MAX_VARS, NOISE_DIM
-    from .bv_gan import BVIterativeGenerator, BV_NOISE_DIM
-    _TORCH = True
-except ImportError:
-    _TORCH = False
+# PyTorch, numpy, and the GAN/encoder modules are only imported when a
+# trained model is actually supplied — they're used exclusively by the GAN
+# fast path (_lia_gan_path / _bv_gan_path). Importing them unconditionally
+# at module load time cost ~1.1s total (torch ~1s, numpy via ns_encoder/
+# ns_bv_encoder ~70-90ms) even on runs with no model to load, which was
+# every run we ever tested with no models/ directory present.
+torch = None
+IterativeGenerator = BVIterativeGenerator = None
+encode = decode_assignment = bv_encode = bv_decode_assignment = None
+
+
+def _import_torch():
+    """Import torch, the GAN generator classes, and the numpy-based
+    encoders on first actual use, and cache them at module scope so
+    repeated calls are free. Returns True if torch is available."""
+    global torch, IterativeGenerator, BVIterativeGenerator
+    global encode, decode_assignment, bv_encode, bv_decode_assignment
+    if torch is not None:
+        return True
+    try:
+        import torch as _torch
+        from .gan    import IterativeGenerator as _lia_gen_cls
+        from .bv_gan import BVIterativeGenerator as _bv_gen_cls
+        from .ns_encoder    import encode as _encode, decode_assignment as _decode
+        from .ns_bv_encoder import bv_encode as _bv_encode, bv_decode_assignment as _bv_decode
+        torch = _torch
+        IterativeGenerator = _lia_gen_cls
+        BVIterativeGenerator = _bv_gen_cls
+        encode, decode_assignment = _encode, _decode
+        bv_encode, bv_decode_assignment = _bv_encode, _bv_decode
+        return True
+    except ImportError:
+        return False
+
 
 from .ns_bitblaster import blast, reconstruct
 from .ns_dpll       import solve_cnf
@@ -54,26 +78,33 @@ class NeuroSymSolver:
         self.n_candidates = n_candidates
         self.timeout_ms   = timeout_ms
 
-        if _TORCH:
+        lia_path = lia_model_path or model_path
+        # Only pay torch's import + module-construction cost if there's an
+        # actual trained model to load. No model path -> no GAN candidates
+        # were ever going to be produced (an untrained/random-weight network
+        # is not a "fast path", it's wasted forward passes before the
+        # symbolic fallback runs anyway) -> skip torch entirely.
+        self._use_lia_gan = bool(lia_path) and _import_torch()
+        self._use_bv_gan  = bool(bv_model_path) and _import_torch()
+        self.device = None
+        self.lia_gen = None
+        self.bv_gen  = None
+
+        if self._use_lia_gan:
             self.device  = torch.device(device)
             self.lia_gen = IterativeGenerator().to(self.device)
             self.lia_gen.eval()
-            lia_path = lia_model_path or model_path
-            if lia_path:
-                state = torch.load(lia_path, map_location=self.device,
-                                   weights_only=True)
-                self.lia_gen.load_state_dict(state)
+            state = torch.load(lia_path, map_location=self.device,
+                               weights_only=True)
+            self.lia_gen.load_state_dict(state)
 
+        if self._use_bv_gan:
+            self.device = self.device or torch.device(device)
             self.bv_gen = BVIterativeGenerator().to(self.device)
             self.bv_gen.eval()
-            if bv_model_path:
-                state = torch.load(bv_model_path, map_location=self.device,
-                                   weights_only=True)
-                self.bv_gen.load_state_dict(state)
-        else:
-            self.device  = None
-            self.lia_gen = None
-            self.bv_gen  = None
+            state = torch.load(bv_model_path, map_location=self.device,
+                               weights_only=True)
+            self.bv_gen.load_state_dict(state)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -98,8 +129,8 @@ class NeuroSymSolver:
 
         deadline = t0 + self.timeout_ms / 1000.0
 
-        # ── GAN fast path ─────────────────────────────────────────────────────
-        if _TORCH:
+        # ── GAN fast path (only if a trained model was actually loaded) ────────
+        if (is_bv and self._use_bv_gan) or (not is_bv and self._use_lia_gan):
             try:
                 if is_bv:
                     r, m = self._bv_gan_path(formula)

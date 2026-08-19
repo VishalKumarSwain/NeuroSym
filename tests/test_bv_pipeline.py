@@ -162,7 +162,7 @@ def test_bv_decode():
 
 def test_solver_bv_sat():
     solver = GANSATSolver(n_candidates=16, timeout_ms=5000)
-    result, model, elapsed = solver.solve_string(BV32_SAT)
+    result, model, elapsed, _formula = solver.solve_string(BV32_SAT)
     assert result == RESULT_SAT, f"Expected sat, got {result}"
     assert "x" in model and "y" in model
     x, y = model["x"], model["y"]
@@ -174,14 +174,14 @@ def test_solver_bv_sat():
 
 def test_solver_bv_unsat():
     solver = GANSATSolver(n_candidates=16, timeout_ms=5000)
-    result, model, elapsed = solver.solve_string(BV_UNSAT)
+    result, model, elapsed, _formula = solver.solve_string(BV_UNSAT)
     assert result == RESULT_UNSAT, f"Expected unsat, got {result}"
     print(f"[PASS] BV Solver UNSAT — {elapsed:.1f}ms")
 
 
 def test_solver_klee_style():
     solver = GANSATSolver(n_candidates=16, timeout_ms=5000)
-    result, model, elapsed = solver.solve_string(BV_KLEE_STYLE)
+    result, model, elapsed, _formula = solver.solve_string(BV_KLEE_STYLE)
     assert result == RESULT_SAT, f"Expected sat, got {result}"
     val = model.get("symb", -1)
     assert 0 < val < 7 and val != 3, f"symb={val} violates constraints"
@@ -190,7 +190,7 @@ def test_solver_klee_style():
 
 def test_solver_bv8():
     solver = GANSATSolver(n_candidates=16, timeout_ms=5000)
-    result, model, elapsed = solver.solve_string(BV8_SAT)
+    result, model, elapsed, _formula = solver.solve_string(BV8_SAT)
     assert result == RESULT_SAT, f"Expected sat, got {result}"
     print(f"[PASS] BV8 Solver — {elapsed:.1f}ms  model={model}")
 

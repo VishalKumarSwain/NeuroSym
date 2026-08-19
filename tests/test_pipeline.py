@@ -145,7 +145,7 @@ def test_violation_score():
 
 def test_solver_sat():
     solver = GANSATSolver(model_path=None, n_candidates=8, timeout_ms=5000)
-    result, model, elapsed = solver.solve_string(SIMPLE_SAT)
+    result, model, elapsed, _formula = solver.solve_string(SIMPLE_SAT)
     assert result == RESULT_SAT, f"Expected sat, got {result}"
     assert "x" in model or "y" in model
     print(f"[PASS] solver SAT — {elapsed:.1f}ms  model={model}")
@@ -153,7 +153,7 @@ def test_solver_sat():
 
 def test_solver_unsat():
     solver = GANSATSolver(model_path=None, n_candidates=8, timeout_ms=5000)
-    result, model, elapsed = solver.solve_string(SIMPLE_UNSAT)
+    result, model, elapsed, _formula = solver.solve_string(SIMPLE_UNSAT)
     assert result == RESULT_UNSAT, f"Expected unsat, got {result}"
     print(f"[PASS] solver UNSAT — {elapsed:.1f}ms")
 

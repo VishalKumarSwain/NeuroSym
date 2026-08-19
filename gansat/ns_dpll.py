@@ -17,6 +17,7 @@ Implements:
 """
 
 from typing import List, Dict, Optional, Tuple, Set
+import heapq
 import time
 
 
@@ -86,6 +87,27 @@ class DPLL:
             for lit in clause:
                 self.activity[lit] += 1.0
 
+        # VSIDS decision priority queue (lazy-deletion max-heap, MiniSat-style):
+        # _decide() used to do a full O(n_vars) linear scan of every variable
+        # on every single decision, re-checking val[v]==_UNSET each time —
+        # O(decisions * n_vars) overall. var_priority[v] tracks
+        # max(activity[pos(v)], activity[neg(v)]); a var has a live heap
+        # entry (in_heap[v]=True) exactly while it's unassigned. _enqueue()
+        # clears the flag on assignment, _backjump() re-pushes with the
+        # (possibly since-increased) current priority on unassignment. Stale
+        # entries left behind by priority bumps or by variables cycling
+        # through assign/backjump are simply skipped by the in_heap check
+        # when popped — never physically removed, which is what makes this
+        # O(log n_vars) instead of needing a full removable-heap structure.
+        self.var_priority: List[float] = [0.0] * (n_vars + 1)
+        for v in range(1, n_vars + 1):
+            self.var_priority[v] = max(self.activity[_pos(v)], self.activity[_neg(v)])
+        self._heap: List[Tuple[float, int]] = [
+            (-self.var_priority[v], v) for v in range(1, n_vars + 1)
+        ]
+        heapq.heapify(self._heap)
+        self._in_heap: List[bool] = [False] + [True] * n_vars
+
         # Two-watched-literal scheme: watch[lit] → list of clause indices
         self.watch: List[List[int]] = [[] for _ in range(self.n_lits)]
         for ci, clause in enumerate(self.clauses):
@@ -122,6 +144,7 @@ class DPLL:
         self.reason[v] = reason
         self.trail.append((v, value, self.dl))
         self.prop_queue.append(lit)
+        self._in_heap[v] = False
         return True
 
     # ── Unit propagation ───────────────────────────────────────────────────────
@@ -208,6 +231,7 @@ class DPLL:
                     seen.add(v)
                     self.activity[lit]     += 1.0
                     self.activity[lit ^ 1] += 1.0
+                    self.var_priority[v] = max(self.activity[_pos(v)], self.activity[_neg(v)])
                     if self.level[v] == self.dl:
                         counter += 1
                     else:
@@ -250,6 +274,9 @@ class DPLL:
             self.val[v]    = _UNSET
             self.level[v]  = 0
             self.reason[v] = -1
+            if not self._in_heap[v]:
+                self._in_heap[v] = True
+                heapq.heappush(self._heap, (-self.var_priority[v], v))
         # Restore trail_lim
         while self.trail_lim and self.trail_lim[-1] > level:
             self.trail_lim.pop()
@@ -268,18 +295,16 @@ class DPLL:
     # ── Decision heuristic (VSIDS-lite) ───────────────────────────────────────
 
     def _decide(self) -> Optional[int]:
-        """Pick an unassigned variable; return its positive literal or None."""
-        best_lit = -1
-        best_act = -1.0
-        for v in range(1, self.n_vars + 1):
-            if self.val[v] == _UNSET:
-                p = _pos(v)
-                n = _neg(v)
-                act = max(self.activity[p], self.activity[n])
-                if act > best_act:
-                    best_act = act
-                    best_lit = p if self.activity[p] >= self.activity[n] else n
-        return best_lit if best_lit != -1 else None
+        """Pick the unassigned variable with highest VSIDS priority; return
+        its positive or negative literal (whichever polarity has the higher
+        current activity) or None if all variables are assigned."""
+        while self._heap:
+            _, v = heapq.heappop(self._heap)
+            if not self._in_heap[v]:
+                continue   # stale entry: v was assigned since this was pushed
+            p, n = _pos(v), _neg(v)
+            return p if self.activity[p] >= self.activity[n] else n
+        return None
 
     # ── Restart ────────────────────────────────────────────────────────────────
 
