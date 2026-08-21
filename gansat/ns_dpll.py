@@ -17,6 +17,7 @@ Implements:
 """
 
 from typing import List, Dict, Optional, Tuple, Set
+from collections import deque
 import heapq
 import time
 
@@ -117,8 +118,11 @@ class DPLL:
             elif len(clause) == 1:
                 pass  # unit clause handled during init propagation
 
-        # Propagation queue
-        self.prop_queue: List[int] = []   # literals to propagate
+        # Propagation queue. deque, not list — _propagate() pops from the
+        # front on every literal; list.pop(0) is O(n) (shifts the whole
+        # list down), turning BCP into O(n^2) on any formula with many
+        # propagations. deque.popleft() is O(1).
+        self.prop_queue: deque = deque()   # literals to propagate
 
         # Conflict count for restart scheduling
         self.conflicts = 0
@@ -152,7 +156,7 @@ class DPLL:
     def _propagate(self) -> int:
         """BCP. Returns -1 on no conflict, else conflicting clause index."""
         while self.prop_queue:
-            lit   = self.prop_queue.pop(0)
+            lit   = self.prop_queue.popleft()
             false_lit = lit ^ 1           # the literal that became False
             watch_list = self.watch[false_lit]
             new_watch  = []
