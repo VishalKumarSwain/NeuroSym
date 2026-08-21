@@ -66,7 +66,19 @@ def main():
         print("unknown", flush=True)
         sys.exit(1)
 
-    print(format_output(result, model, formula.variables), flush=True)
+    try:
+        print(format_output(result, model, formula.variables), flush=True)
+    except BrokenPipeError:
+        # The caller (e.g. ESBMC under --branch-coverage, which spawns one
+        # NeuroSym subprocess per claim) can hit its own timeout and tear
+        # down the pipe while we're mid-write. That's the caller giving up
+        # on us, not a bug here -- exit quietly instead of an ugly traceback.
+        # Standard fix for BrokenPipeError on stdout: redirect stdout to
+        # devnull before exit so Python's own shutdown-time flush doesn't
+        # raise the same error a second time.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(1)
     sys.exit(0 if result in (RESULT_SAT, RESULT_UNSAT) else 1)
 
 
