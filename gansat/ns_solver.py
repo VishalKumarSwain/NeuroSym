@@ -54,8 +54,21 @@ def _import_torch():
 
 
 from .ns_bitblaster import blast, reconstruct
-from .ns_dpll       import solve_cnf
+from .ns_dpll       import solve_cnf as _dpll_solve_cnf
 from .ns_lia        import solve_lia
+from . import ns_minisat
+from .ns_fallback   import formula_uses_arrays
+
+def solve_cnf(clauses, n_vars, deadline=None):
+    """CNF entry point for _bv_solve: MiniSat when it's installed (a
+    mature, compiled SAT solver -- much faster search than a from-scratch
+    Python DPLL on the exact same clauses our own bit-blaster produces),
+    falling back to ns_dpll's own solver when it isn't. Same contract
+    either way: {var: bool} on SAT, None on UNSAT or timeout."""
+    if ns_minisat.available():
+        return ns_minisat.solve_cnf(clauses, n_vars, deadline=deadline)
+    return _dpll_solve_cnf(clauses, n_vars, deadline=deadline)
+
 
 RESULT_SAT     = "sat"
 RESULT_UNSAT   = "unsat"
@@ -77,34 +90,55 @@ class NeuroSymSolver:
     ):
         self.n_candidates = n_candidates
         self.timeout_ms   = timeout_ms
+        self._device_str  = device
 
-        lia_path = lia_model_path or model_path
-        # Only pay torch's import + module-construction cost if there's an
-        # actual trained model to load. No model path -> no GAN candidates
-        # were ever going to be produced (an untrained/random-weight network
-        # is not a "fast path", it's wasted forward passes before the
-        # symbolic fallback runs anyway) -> skip torch entirely.
-        self._use_lia_gan = bool(lia_path) and _import_torch()
-        self._use_bv_gan  = bool(bv_model_path) and _import_torch()
-        self.device = None
+        # A model *path* being configured only means the GAN is available
+        # to try, not that anything has been loaded yet -- torch import,
+        # network construction, and the state_dict load (~2s, measured)
+        # are deferred to _ensure_bv_gan_loaded/_ensure_lia_gan_loaded,
+        # called only right before _solve() is actually about to attempt
+        # that path. An array-touching formula skips the GAN branch
+        # entirely (see _solve), so it now also skips paying this loading
+        # cost at all -- not just the forward pass.
+        self._lia_path   = lia_model_path or model_path
+        self._bv_path    = bv_model_path
+        self._use_lia_gan = bool(self._lia_path)
+        self._use_bv_gan  = bool(self._bv_path)
+        self._lia_gan_loaded = False
+        self._bv_gan_loaded  = False
+        self.device  = None
         self.lia_gen = None
         self.bv_gen  = None
 
-        if self._use_lia_gan:
-            self.device  = torch.device(device)
-            self.lia_gen = IterativeGenerator().to(self.device)
-            self.lia_gen.eval()
-            state = torch.load(lia_path, map_location=self.device,
-                               weights_only=True)
-            self.lia_gen.load_state_dict(state)
+    def _ensure_lia_gan_loaded(self) -> bool:
+        if self._lia_gan_loaded:
+            return self.lia_gen is not None
+        self._lia_gan_loaded = True
+        if not (self._use_lia_gan and _import_torch()):
+            self._use_lia_gan = False
+            return False
+        self.device  = self.device or torch.device(self._device_str)
+        self.lia_gen = IterativeGenerator().to(self.device)
+        self.lia_gen.eval()
+        state = torch.load(self._lia_path, map_location=self.device,
+                           weights_only=True)
+        self.lia_gen.load_state_dict(state)
+        return True
 
-        if self._use_bv_gan:
-            self.device = self.device or torch.device(device)
-            self.bv_gen = BVIterativeGenerator().to(self.device)
-            self.bv_gen.eval()
-            state = torch.load(bv_model_path, map_location=self.device,
-                               weights_only=True)
-            self.bv_gen.load_state_dict(state)
+    def _ensure_bv_gan_loaded(self) -> bool:
+        if self._bv_gan_loaded:
+            return self.bv_gen is not None
+        self._bv_gan_loaded = True
+        if not (self._use_bv_gan and _import_torch()):
+            self._use_bv_gan = False
+            return False
+        self.device = self.device or torch.device(self._device_str)
+        self.bv_gen = BVIterativeGenerator().to(self.device)
+        self.bv_gen.eval()
+        state = torch.load(self._bv_path, map_location=self.device,
+                           weights_only=True)
+        self.bv_gen.load_state_dict(state)
+        return True
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -120,6 +154,14 @@ class NeuroSymSolver:
         result, model, elapsed_ms = self._solve(formula)
         return result, model, elapsed_ms, formula
 
+    def solve_formula(self, formula: NsFormula) -> Tuple[str, Optional[dict], float]:
+        """Solve an already-parsed formula. For callers that need to
+        inspect the parsed formula before deciding whether to run
+        NeuroSym's own pipeline at all (e.g. skipping straight to an
+        external-solver fallback for array-heavy formulas -- see
+        ns_fallback.formula_uses_arrays) rather than parsing twice."""
+        return self._solve(formula)
+
     # ── Internal dispatch ─────────────────────────────────────────────────────
 
     def _solve(self, formula: NsFormula) -> Tuple[str, Optional[dict], float]:
@@ -129,13 +171,32 @@ class NeuroSymSolver:
 
         deadline = t0 + self.timeout_ms / 1000.0
 
+        # Array-touching formulas: go straight to bit-blast + MiniSat, skip
+        # the GAN entirely. The GAN's own formula encoder (bv_encoder.py)
+        # has no representation for array theory at all -- it was trained
+        # on a fixed (variables, constraints) encoding with nothing to
+        # capture select/store semantics -- so a forward pass here is not a
+        # "fast guess that might miss", it is a guess the encoding can't
+        # possibly ground truth against. Trying it first only adds the
+        # GAN's own overhead (model already loaded, but still a real
+        # forward pass) before falling through to the path that can
+        # actually reason about the formula. ns_bitblaster's own array
+        # encoding (select/store/as-const, read-over-write + weak
+        # consistency axioms) already understands arrays and MiniSat
+        # resolves the resulting CNF fast -- let it run immediately.
+        uses_arrays = is_bv and formula_uses_arrays(formula)
+
         # ── GAN fast path (only if a trained model was actually loaded) ────────
-        if (is_bv and self._use_bv_gan) or (not is_bv and self._use_lia_gan):
+        if not uses_arrays and (
+            (is_bv and self._use_bv_gan) or (not is_bv and self._use_lia_gan)
+        ):
             try:
                 if is_bv:
-                    r, m = self._bv_gan_path(formula)
+                    gan_ready = self._ensure_bv_gan_loaded()
+                    r, m = self._bv_gan_path(formula) if gan_ready else (RESULT_UNKNOWN, None)
                 elif logic in _LIA_LOGICS or formula.variables:
-                    r, m = self._lia_gan_path(formula)
+                    gan_ready = self._ensure_lia_gan_loaded()
+                    r, m = self._lia_gan_path(formula) if gan_ready else (RESULT_UNKNOWN, None)
                 else:
                     r, m = RESULT_UNKNOWN, None
 
