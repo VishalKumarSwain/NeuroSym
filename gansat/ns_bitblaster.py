@@ -337,10 +337,89 @@ class _Blaster:
         self.var_map: Dict[str, List[int]] = {}
         self._cache: Dict[int, object] = {}   # id(term) → blasted value
 
+        # Array theory (read-over-write + weak consistency axioms — no
+        # dedicated array decision procedure, so arrays are encoded lazily
+        # as they're touched by select/store, keyed by the array "root"
+        # variable's name rather than object identity: the parser builds a
+        # fresh Var(name, sort) at every occurrence of a variable, so two
+        # selects on "the same array" are two different Var objects with
+        # the same .name -- id(term) would wrongly treat them as unrelated
+        # arrays. array_name -> [(index_bits, value_bits), ...] of every
+        # select resolved against that array so far.
+        self._array_reads: Dict[str, List[Tuple[List[int], List[int]]]] = {}
+
     def _bv_var(self, name: str, width: int) -> List[int]:
         if name not in self.var_map:
             self.var_map[name] = self.alloc.fresh_bits(width)
         return self.var_map[name]
+
+    # ── Array theory ─────────────────────────────────────────────────────
+
+    def _blast_value(self, term: Term, sort) -> List[int]:
+        """Blast a term known to have sort `sort` (an array's element
+        sort) — dispatches to blast_bool (wrapped as a 1-bit list) or
+        blast_bv, since the two produce differently-shaped results and the
+        element sort isn't always recoverable from `term.sort` alone (e.g.
+        a boolean literal used as a store's value)."""
+        if isinstance(sort, BoolSort):
+            return [self.blast_bool(term)]
+        return self.blast_bv(term)
+
+    def _blast_select(self, arr_term: Term, idx_term: Term, elem_sort) -> List[int]:
+        """select(arr_term, idx_term), returning `elem_sort`-shaped bits.
+
+        No dedicated array decision procedure: store/as_const/ite chains
+        are peeled by direct term rewriting (read-over-write) rather than
+        bit-blasted as arrays in their own right, so a store never itself
+        needs an array representation -- only the eventual select does.
+        Bottoms out at a genuine array variable (or any other opaque
+        array-valued term), where consistency with every previously
+        resolved select against that same array is enforced by the weak
+        array axiom: idx_i == idx_j -> value_i == value_j."""
+        out   = self.clauses
+        alloc = self.alloc
+        width = elem_sort.width if isinstance(elem_sort, BVSort) else 1
+
+        if isinstance(arr_term, App) and arr_term.op == 'store':
+            a0, i0, v0 = arr_term.args
+            idx_bits  = self.blast_bv(idx_term)
+            i0_bits   = self.blast_bv(i0)
+            eq        = _bv_eq(idx_bits, i0_bits, out, alloc)
+            then_bits = self._blast_value(v0, elem_sort)
+            else_bits = self._blast_select(a0, idx_term, elem_sort)
+            return [_gate_ite(eq, then_bits[k], else_bits[k], out, alloc)
+                    for k in range(width)]
+
+        if isinstance(arr_term, App) and arr_term.op == 'as_const':
+            # Constant array: every index maps to the same value.
+            return self._blast_value(arr_term.args[0], elem_sort)
+
+        if isinstance(arr_term, App) and arr_term.op == 'ite':
+            cond   = self.blast_bool(arr_term.args[0])
+            t_bits = self._blast_select(arr_term.args[1], idx_term, elem_sort)
+            e_bits = self._blast_select(arr_term.args[2], idx_term, elem_sort)
+            return [_gate_ite(cond, t_bits[k], e_bits[k], out, alloc)
+                    for k in range(width)]
+
+        # Base case: an opaque array (a Var, or any other term we don't
+        # peel further). Key by variable name, not id(term) -- the parser
+        # builds a fresh Var object per occurrence, so two selects on "the
+        # same array" are different objects sharing a .name.
+        key = arr_term.name if isinstance(arr_term, Var) else f"#anon{id(arr_term)}"
+        idx_bits    = self.blast_bv(idx_term)
+        result_bits = alloc.fresh_bits(width)
+
+        prior = self._array_reads.setdefault(key, [])
+        for prev_idx_bits, prev_result_bits in prior:
+            idx_eq = _bv_eq(idx_bits, prev_idx_bits, out, alloc)
+            for k in range(width):
+                val_eq = _gate_not(
+                    _gate_xor(result_bits[k], prev_result_bits[k], out, alloc),
+                    out, alloc)
+                out.append([-idx_eq, val_eq])   # idx_i==idx_j -> bit_k equal
+        prior.append((idx_bits, result_bits))
+
+        return result_bits
 
     def blast_bv(self, term: Term) -> List[int]:
         """Return list of SAT literals (MSB first) representing BV term."""
@@ -445,6 +524,9 @@ class _Blaster:
             e_    = self.blast_bv(args[2])
             return [_gate_ite(cond, t_[i], e_[i], out, alloc) for i in range(len(t_))]
 
+        if op == 'select':
+            return self._blast_select(args[0], args[1], term.sort)
+
         # Fallback: fresh unconstrained bits
         return self.alloc.fresh_bits(w)
 
@@ -536,6 +618,10 @@ class _Blaster:
 
         if op == 'bvcomp':
             bits = self.blast_bv(term)
+            return bits[0]
+
+        if op == 'select':
+            bits = self._blast_select(args[0], args[1], BOOL)
             return bits[0]
 
         return _CONST_TRUE(out, alloc)
