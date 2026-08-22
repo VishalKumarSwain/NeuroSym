@@ -84,12 +84,21 @@ class NeuroSymSolver:
         model_path:     Optional[str] = None,
         bv_model_path:  Optional[str] = None,
         lia_model_path: Optional[str] = None,
-        n_candidates:   int  = 8,
-        timeout_ms:     int  = 20_000,
-        device:         str  = "cpu",
+        n_candidates:      int  = 8,
+        timeout_ms:        int  = 20_000,
+        minisat_timeout_ms: int = 20 * 60_000,
+        device:            str  = "cpu",
     ):
         self.n_candidates = n_candidates
         self.timeout_ms   = timeout_ms
+        # The CNF search (MiniSat when installed, ns_dpll otherwise) gets
+        # its own, larger minimum budget, independent of --timeout: a
+        # genuinely large formula can need real search time, and the
+        # GAN/LIA paths' short default timeout shouldn't cut that attempt
+        # off early just because it governs everything else. Falling
+        # through to the external solver chain (ns_fallback.py) only
+        # happens once *this* budget is actually exhausted.
+        self.minisat_timeout_ms = minisat_timeout_ms
         self._device_str  = device
 
         # A model *path* being configured only means the GAN is available
@@ -206,13 +215,19 @@ class NeuroSymSolver:
                 pass
 
         # ── Symbolic fallback — own solvers only ──────────────────────────────
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return RESULT_UNKNOWN, None, (time.time() - t0) * 1000
-
         if is_bv:
-            result, model = self._bv_solve(formula, deadline)
+            # The CNF search gets its own minimum window (minisat_timeout_ms,
+            # default 20 min) regardless of the shorter --timeout that
+            # governs the GAN path above -- never *shorter* than the general
+            # deadline (a larger --timeout still wins), only ever extended.
+            cnf_deadline = max(deadline, t0 + self.minisat_timeout_ms / 1000.0)
+            if cnf_deadline - time.time() <= 0:
+                return RESULT_UNKNOWN, None, (time.time() - t0) * 1000
+            result, model = self._bv_solve(formula, cnf_deadline)
         else:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return RESULT_UNKNOWN, None, (time.time() - t0) * 1000
             result, model = self._lia_solve(formula, deadline)
 
         return result, model, (time.time() - t0) * 1000

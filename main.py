@@ -42,6 +42,14 @@ def main():
     parser.add_argument("--stdin",     action="store_true")
     parser.add_argument("--candidates", type=int, default=8)
     parser.add_argument("--timeout",   type=int, default=20_000)
+    parser.add_argument(
+        "--minisat-timeout", type=int, default=20 * 60_000,
+        help="Minimum time budget (ms) for the CNF search (MiniSat when "
+             "installed, ns_dpll otherwise) specifically -- independent of "
+             "--timeout, and never shorter than it. Only once this is "
+             "actually exhausted does NeuroSym report unknown and (unless "
+             "--no-fallback) hand the formula to boolector/z3. Default "
+             "1200000 (20 min).")
     parser.add_argument("--device",    default="cpu")
     parser.add_argument(
         "--no-fallback", action="store_true",
@@ -63,6 +71,7 @@ def main():
         lia_model_path=lia_model_path,
         n_candidates=args.candidates,
         timeout_ms=args.timeout,
+        minisat_timeout_ms=args.minisat_timeout,
         device=args.device,
     )
 
