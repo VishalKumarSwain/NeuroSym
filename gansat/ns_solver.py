@@ -196,6 +196,19 @@ class NeuroSymSolver:
         uses_arrays = is_bv and formula_uses_arrays(formula)
 
         # ── GAN fast path (only if a trained model was actually loaded) ────────
+        # Tried running this concurrently with the symbolic path (a thread
+        # each, racing for whichever finishes first) -- measured slower in
+        # practice, not faster: Python's GIL means the two threads don't get
+        # genuine parallelism for this CPU-bound mix (torch's own import
+        # machinery in particular holds the GIL heavily), so a trivial
+        # formula that solved symbolically alone in 0.16s took 10.75s with
+        # the GAN thread running alongside it -- worse than the plain
+        # sequential 2.8s baseline it was meant to improve on. True
+        # parallelism would need separate processes (the loaded torch model
+        # isn't trivially shareable across a process boundary) -- a bigger
+        # rewrite, not attempted here. Back to sequential: GAN first, since
+        # it's normally fast when it does hit, symbolic only once it either
+        # doesn't apply (arrays) or comes back inconclusive.
         if not uses_arrays and (
             (is_bv and self._use_bv_gan) or (not is_bv and self._use_lia_gan)
         ):
@@ -267,7 +280,15 @@ class NeuroSymSolver:
     def _bv_solve(self, formula: NsFormula,
                   deadline: float) -> Tuple[str, Optional[dict]]:
         try:
-            clauses, n_vars, var_map = blast(formula)
+            # Previously unbounded: for a large enough formula, bit-blasting
+            # itself (not the CNF search that follows it) could run past
+            # the deadline with no way to detect that and hand off to the
+            # external fallback -- measured directly, a 160,671-assignment
+            # formula was still bit-blasting past the 20-minute MiniSat
+            # floor, MiniSat never even reached. Passing the same deadline
+            # through here lets blast() raise BlastTimeout (caught below,
+            # same as any other blast failure) instead of running forever.
+            clauses, n_vars, var_map = blast(formula, deadline=deadline)
         except Exception:
             return RESULT_UNKNOWN, None
 

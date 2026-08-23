@@ -16,12 +16,27 @@ After DPLL returns an assignment, call reconstruct(sat_assign, var_map) to
 get the BV assignment dict.
 """
 
+import time
 from typing import List, Dict, Tuple, Optional
 from .ns_ast import (
     Term, BoolLit, IntLit, BVLit, Var, App,
     NsFormula, BoolSort, IntSort, BVSort, ArraySort,
     BOOL, TRUE, FALSE,
 )
+
+
+class BlastTimeout(Exception):
+    """Raised mid-blast when a deadline was given and is exceeded.
+    Bit-blasting itself was previously unbounded -- ns_solver's own
+    minisat_timeout_ms only ever governed the CNF *search* (MiniSat/
+    ns_dpll), not the step that builds the CNF in the first place. Measured
+    directly: a 160,671-assignment ESBMC formula (998 bundled VCCs, a
+    fully-unwound 1000-iteration loop) never even reached MiniSat -- still
+    bit-blasting past the 20-minute floor, with no way to detect that and
+    hand off to the external fallback instead of running unbounded."""
+    pass
+
+
 
 
 # ── Variable allocator ─────────────────────────────────────────────────────────
@@ -331,11 +346,23 @@ def _bv_ashr(a_bits: List[int], b_bits: List[int],
 # ── Main blaster ───────────────────────────────────────────────────────────────
 
 class _Blaster:
-    def __init__(self):
+    def __init__(self, deadline: Optional[float] = None):
         self.alloc   = _Alloc()
         self.clauses: List[List[int]] = []
         self.var_map: Dict[str, List[int]] = {}
         self._cache: Dict[int, object] = {}   # id(term) → blasted value
+        self._deadline = deadline
+
+    def _check_deadline(self) -> None:
+        # Checked on every blast_bv/blast_bool entry, not batched by a call
+        # counter: a *single* call (e.g. a wide bvmul, O(width^2) gates) can
+        # internally generate tens of thousands of clauses on its own, so
+        # batching by call count can still let a lot of real wall-time slip
+        # through unchecked between checks. time.time() itself is cheap
+        # (microseconds) next to the arithmetic each call already does --
+        # correctness here is worth far more than that negligible overhead.
+        if self._deadline is not None and time.time() > self._deadline:
+            raise BlastTimeout()
 
         # Array theory (read-over-write + weak consistency axioms — no
         # dedicated array decision procedure, so arrays are encoded lazily
@@ -427,6 +454,7 @@ class _Blaster:
         if tid in self._cache:
             return self._cache[tid]
 
+        self._check_deadline()
         result = self._blast_bv_inner(term)
         self._cache[tid] = result
         return result
@@ -535,6 +563,7 @@ class _Blaster:
         tid = id(term)
         if tid in self._cache:
             return self._cache[tid]
+        self._check_deadline()
         result = self._blast_bool_inner(term)
         self._cache[tid] = result
         return result
@@ -629,12 +658,16 @@ class _Blaster:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def blast(formula: NsFormula):
+def blast(formula: NsFormula, deadline: Optional[float] = None):
     """
     Bit-blast a QF_BV / QF_ABV formula.
     Returns (clauses, n_vars, var_map).
+    Raises BlastTimeout if `deadline` (an absolute time.time() value) is
+    given and exceeded before blasting finishes -- checked on every
+    not-yet-cached term visited via blast_bv/blast_bool. A cache hit skips
+    the check: it does no new work, so it can't be what overruns a deadline.
     """
-    blaster = _Blaster()
+    blaster = _Blaster(deadline=deadline)
     top_lits = []
 
     for assertion in formula.assertions:
