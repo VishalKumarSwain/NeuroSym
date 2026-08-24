@@ -35,18 +35,48 @@ _FALLBACK_SOLVERS = ["boolector", "z3"]
 
 _ARRAY_OPS = frozenset(("select", "store", "as_const"))
 
+# ESBMC flattens C-level arrays/pointers into this machinery *before*
+# NeuroSym ever sees the formula (its own memory-object model -- ptr_obj
+# address ranges, tuple-flattener array collation), so a formula that came
+# from an array-touching C program does not actually contain a select/store/
+# Array-sorted term by the time it reaches us. What survives flattening is
+# these variable-name prefixes, confirmed directly against a real
+# ESBMC-generated formula (test.c): '__ESBMC_ptr_obj_start_'/'_end_',
+# 'smt_conv::__ESBMC_ptr_addr_range_', 'smt_conv::smt_conv::
+# collate_array_vals::'. Matching on these catches exactly the class of
+# formula the select/store walk below can't -- the array is gone, but its
+# fingerprint in the encoding isn't.
+_ESBMC_ARRAY_FLATTEN_MARKERS = (
+    "__ESBMC_ptr_obj_",
+    "__ESBMC_ptr_addr_range_",
+    "collate_array_vals",
+    "__ESBMC_addrspace_arr_",
+    "tuple_create",
+)
+
 
 def formula_uses_arrays(formula) -> bool:
     """True if `formula` touches array theory anywhere -- a declared
-    array-sorted variable, or a select/store/as_const term. Measured
-    directly (test.c, an array-touching ESBMC-generated formula): NeuroSym's
-    own DPLL took 60+s and still returned unknown on a formula z3 solved in
-    under 10s -- ESBMC's memory model routes array/pointer access through
-    machinery that blows a modest C program up into a formula with over a
-    million boolean variables after bit-blasting, and there is no upside in
-    waiting out NeuroSym's own --timeout on that class of formula first. If
-    this check is true, skip straight to the external fallback instead."""
+    array-sorted variable, a select/store/as_const term, or (see
+    _ESBMC_ARRAY_FLATTEN_MARKERS above) a variable name fingerprint left
+    behind by ESBMC's own array/pointer flattening even once the array
+    itself is gone. Measured directly (test.c, an array-touching
+    ESBMC-generated formula): NeuroSym's own DPLL took 60+s and still
+    returned unknown on a formula z3 solved in under 10s -- ESBMC's memory
+    model routes array/pointer access through machinery that blows a
+    modest C program up into a formula with over a million boolean
+    variables after bit-blasting, and there is no upside in waiting out
+    NeuroSym's own --timeout (or its GAN path) on that class of formula
+    first. If this check is true, skip straight to bit-blast + MiniSat
+    (or the external fallback) instead."""
     if any(isinstance(v.sort, ArraySort) for v in formula.variables.values()):
+        return True
+
+    if any(
+        marker in name
+        for name in formula.variables
+        for marker in _ESBMC_ARRAY_FLATTEN_MARKERS
+    ):
         return True
 
     seen = set()
