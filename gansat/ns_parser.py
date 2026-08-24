@@ -4,6 +4,7 @@ Supports QF_LIA, QF_BV, QF_ABV (single-query track subset).
 """
 
 import re
+from collections import ChainMap
 from typing import List, Dict, Optional, Tuple, Any
 
 from .ns_ast import (
@@ -406,6 +407,15 @@ def parse_string(smtlib_str: str) -> NsFormula:
     decl_vars: Dict[str, Var] = {}
     assertions: List[Term]    = []
     defs:       Dict[str, Term] = {}
+    # env mirrors decl_vars+defs incrementally (updated at every insertion
+    # point below) instead of being rebuilt as {**decl_vars, **defs} at
+    # every single 'assert' -- that rebuild is O(declared vars) per call,
+    # so for N declarations followed by N asserts (typical: one assert per
+    # SSA step in a large ESBMC-generated formula) it was O(N^2) overall.
+    # Measured directly: 4000 vars + ~4000 asserts took 3.3s just to parse,
+    # 1.07s of that inside parse_string itself (not sub-calls) -- almost
+    # entirely this dict-copy, per cProfile.
+    env: Dict[str, Term] = {}
 
     while not st.at_end():
         if st.peek() != '(':
@@ -431,6 +441,7 @@ def parse_string(smtlib_str: str) -> NsFormula:
             if not param_sorts:
                 v = Var(name, ret_sort)
                 decl_vars[name] = v
+                env[name] = v
             # function declarations with params: skip for now
 
         elif cmd == 'declare-const':
@@ -439,6 +450,7 @@ def parse_string(smtlib_str: str) -> NsFormula:
             st.expect(')')
             v = Var(name, ret_sort)
             decl_vars[name] = v
+            env[name] = v
 
         elif cmd == 'define-fun':
             name = st.pop()
@@ -452,14 +464,22 @@ def parse_string(smtlib_str: str) -> NsFormula:
                 params.append((pname, psort))
             st.expect(')')
             _ret_sort = _parse_sort(st)
-            body = _parse_term(st, {**decl_vars, **defs,
-                                    **{p: Var(p, s) for p, s in params}})
+            # Local params shadow env for just this body: a plain dict
+            # union here would be the same O(declared vars) copy the
+            # 'assert' case used to pay on every call (see the note by
+            # env's declaration above) -- params is small (function
+            # arity) and define-fun is rare next to assert, but there is
+            # no reason to pay a copy of the *whole* env for it either
+            # when a lightweight chained view does the same lookups.
+            body_env = ChainMap({p: Var(p, s) for p, s in params}, env) \
+                if params else env
+            body = _parse_term(st, body_env)
             st.expect(')')
             if not params:
                 defs[name] = body  # constant definition
+                env[name]  = body
 
         elif cmd == 'assert':
-            env  = {**decl_vars, **defs}
             term = _parse_term(st, env)
             st.expect(')')
             assertions.append(term)
