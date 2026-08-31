@@ -53,10 +53,27 @@ TIMEOUT_S = 4.5   # leave 0.5 s margin from 5 s overall limit
 
 class DPLL:
     def __init__(self, clauses: List[List[int]], n_vars: int,
-                 deadline: Optional[float] = None):
+                 deadline: Optional[float] = None,
+                 seed: Optional[int] = None):
         self.n_vars   = n_vars
         self.n_lits   = 2 * n_vars
         self.deadline = deadline
+
+        # Per-variable random tiebreak, used only to break equal-priority
+        # heap ties (see _heap below). None (the default) reproduces the
+        # old deterministic tie-by-variable-index behaviour exactly. A seed
+        # is what portfolio racing (solve_cnf_portfolio) uses to give each
+        # parallel worker a genuinely different decision order on equal-
+        # priority variables -- VSIDS activity itself is a sum over clauses
+        # and so is order-independent; without perturbing tiebreaks
+        # directly, "different" workers end up exploring the same search
+        # tree and gain nothing from racing.
+        if seed is None:
+            self._tiebreak: List[float] = list(range(n_vars + 1))
+        else:
+            import random
+            rng = random.Random(seed)
+            self._tiebreak = [0.0] + [rng.random() for _ in range(n_vars)]
 
         # Clause storage: list of lists of internal lits
         self.clauses: List[List[int]] = [_encode_clause(c) for c in clauses if c]
@@ -103,8 +120,8 @@ class DPLL:
         self.var_priority: List[float] = [0.0] * (n_vars + 1)
         for v in range(1, n_vars + 1):
             self.var_priority[v] = max(self.activity[_pos(v)], self.activity[_neg(v)])
-        self._heap: List[Tuple[float, int]] = [
-            (-self.var_priority[v], v) for v in range(1, n_vars + 1)
+        self._heap: List[Tuple[float, float, int]] = [
+            (-self.var_priority[v], self._tiebreak[v], v) for v in range(1, n_vars + 1)
         ]
         heapq.heapify(self._heap)
         self._in_heap: List[bool] = [False] + [True] * n_vars
@@ -280,7 +297,7 @@ class DPLL:
             self.reason[v] = -1
             if not self._in_heap[v]:
                 self._in_heap[v] = True
-                heapq.heappush(self._heap, (-self.var_priority[v], v))
+                heapq.heappush(self._heap, (-self.var_priority[v], self._tiebreak[v], v))
         # Restore trail_lim
         while self.trail_lim and self.trail_lim[-1] > level:
             self.trail_lim.pop()
@@ -303,7 +320,7 @@ class DPLL:
         its positive or negative literal (whichever polarity has the higher
         current activity) or None if all variables are assigned."""
         while self._heap:
-            _, v = heapq.heappop(self._heap)
+            _, _, v = heapq.heappop(self._heap)
             if not self._in_heap[v]:
                 continue   # stale entry: v was assigned since this was pushed
             p, n = _pos(v), _neg(v)
@@ -375,7 +392,8 @@ class DPLL:
 # ── Public interface ───────────────────────────────────────────────────────────
 
 def solve_cnf(clauses: List[List[int]], n_vars: int,
-              deadline: Optional[float] = None) -> Optional[Dict[int, bool]]:
+              deadline: Optional[float] = None,
+              seed: Optional[int] = None) -> Optional[Dict[int, bool]]:
     """
     Solve a CNF formula.
 
@@ -384,6 +402,8 @@ def solve_cnf(clauses: List[List[int]], n_vars: int,
                Variables are 1-indexed.
     n_vars   : total number of Boolean variables
     deadline : time.time() deadline; returns None if exceeded
+    seed     : if given, perturbs decision tie-breaking (see DPLL.__init__);
+               None reproduces the old fully-deterministic behaviour.
 
     Returns a satisfying assignment {var → bool} or None if UNSAT/timeout.
     """
@@ -395,5 +415,79 @@ def solve_cnf(clauses: List[List[int]], n_vars: int,
         if len(c) == 0:
             return None
 
-    solver = DPLL(clauses, n_vars, deadline)
+    solver = DPLL(clauses, n_vars, deadline, seed=seed)
     return solver.solve()
+
+
+# ── Portfolio racing (mitigates heavy-tailed DPLL runtime variance) ─────────────
+#
+# The same CNF, solved by the same deterministic DPLL, can occasionally take
+# far longer than typical purely from which branch of the search tree gets
+# explored first -- the classic "heavy-tailed" runtime phenomenon documented
+# in the SAT literature (Gomes et al.). NOTE: on this codebase, the real
+# production path (ns_solver.solve_cnf) already prefers a compiled MiniSat
+# binary when one is on PATH (see ns_minisat.py) and only falls back to this
+# pure-Python DPLL when MiniSat is unavailable -- so this portfolio wrapper
+# matters for that fallback case, not the common case on a machine with
+# MiniSat installed.
+
+def _portfolio_worker(clauses, n_vars, deadline, seed, result_queue):
+    # seed perturbs DPLL's own decision tie-breaking directly (see
+    # DPLL.__init__) -- this is what actually diversifies each worker's
+    # search path. An earlier version of this function instead shuffled
+    # clause order before solving, which turned out to be a near no-op:
+    # VSIDS activity is a sum over clauses (order-independent) and the old
+    # heap tie-break was the variable index, not insertion order, so
+    # "differently shuffled" workers ended up exploring nearly the same
+    # search tree and gained nothing from racing.
+    try:
+        result = solve_cnf(clauses, n_vars, deadline, seed=seed)
+    except Exception:
+        result = None
+    result_queue.put(result)
+
+
+def solve_cnf_portfolio(
+    clauses: List[List[int]],
+    n_vars: int,
+    deadline: Optional[float] = None,
+    n_workers: int = 4,
+) -> Optional[Dict[int, bool]]:
+    """
+    Like solve_cnf, but races n_workers independently-perturbed DPLL
+    attempts in separate (forked) processes and returns as soon as any
+    one finds a satisfying assignment. Only reports UNSAT/timeout once
+    every worker has independently agreed -- a single worker's None
+    could just be that worker's bad luck, not a proof of unsatisfiability,
+    so it is never trusted alone.
+    """
+    if not clauses:
+        return {}
+    if n_workers <= 1:
+        return solve_cnf(clauses, n_vars, deadline)
+
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    procs = [
+        ctx.Process(target=_portfolio_worker, args=(clauses, n_vars, deadline, seed, q), daemon=True)
+        for seed in range(n_workers)
+    ]
+    for p in procs:
+        p.start()
+
+    try:
+        for _ in range(n_workers):
+            remaining = max(deadline - time.time(), 0.0) if deadline is not None else None
+            try:
+                r = q.get(timeout=remaining)
+            except Exception:
+                break   # ran out of overall deadline waiting on stragglers
+            if r is not None:
+                return r   # first SAT wins -- solve_cnf already verified it internally
+        return None   # every worker agreed: UNSAT (or all independently timed out)
+    finally:
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            p.join(timeout=1)
