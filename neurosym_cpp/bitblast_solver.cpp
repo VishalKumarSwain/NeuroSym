@@ -161,6 +161,13 @@ struct Blaster {
     int constTrueLit = 0; // 1-based dimacs-style literal cache
     int constFalseLit = 0;
     bool haveTrue = false, haveFalse = false;
+    // XOR-gate cache -- keyed by (min(a,b), max(a,b)) since gate_xor(a,b)
+    // and gate_xor(b,a) produce identical clause sets (XOR is symmetric).
+    // Scoped to this Blaster instance (fresh per formula solve), mirroring
+    // the Python _gate_xor cache added to gansat/ns_bitblaster.py's _Alloc.
+    std::map<std::pair<int,int>, int> xorCache;
+    long xorCacheHits = 0, xorCacheMisses = 0;
+    long xorVarsAvoided = 0, xorClausesAvoided = 0;
 
     Blaster(SimpSolver &s) : S(s) {}
 
@@ -212,11 +219,21 @@ struct Blaster {
         return y;
     }
     int gate_xor(int a, int b) {
+        std::pair<int,int> key = (a <= b) ? std::make_pair(a, b) : std::make_pair(b, a);
+        auto it = xorCache.find(key);
+        if (it != xorCache.end()) {
+            xorCacheHits++;
+            xorVarsAvoided++;
+            xorClausesAvoided += 4;
+            return it->second;
+        }
+        xorCacheMisses++;
         int y = fresh();
         addClauseLits({-y, -a, -b});
         addClauseLits({-y, a, b});
         addClauseLits({y, -a, b});
         addClauseLits({y, a, -b});
+        xorCache[key] = y;
         return y;
     }
     int gate_ite(int c, int t, int e) {
@@ -858,6 +875,8 @@ int main(int argc, char **argv) {
         double solveMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
         fprintf(stderr, "TIMING load_blast_ms=%.3f solve_ms=%.3f total_ms=%.3f\n",
                 loadBlastMs, solveMs, loadBlastMs + solveMs);
+        fprintf(stderr, "STATS vars=%d xor_cache_hits=%ld xor_cache_misses=%ld xor_vars_avoided=%ld xor_clauses_avoided=%ld\n",
+                S.nVars(), bl.xorCacheHits, bl.xorCacheMisses, bl.xorVarsAvoided, bl.xorClausesAvoided);
     }
 
     if (!sat) {

@@ -74,6 +74,17 @@ class _Alloc:
         self.false_allocations = 0  # 0 or 1, ever
         self.bv_const_requests  = 0   # total _int_to_bits() calls
         self._unique_bv_consts: set = set()  # (width, normalized_value) seen
+        # XOR-gate cache -- keyed by the resolved SAT-literal operand pair
+        # (min(a,b), max(a,b)), since _gate_xor(a,b) and _gate_xor(b,a)
+        # produce literally identical clause sets (XOR is symmetric).
+        # Scoped to this _Alloc instance (fresh per formula solve, see
+        # _Blaster.__init__/blast()), so no cross-formula pollution --
+        # same lifetime discipline as _Blaster._eq_cache.
+        self._xor_cache: Dict[tuple, int] = {}
+        self.xor_cache_hits   = 0
+        self.xor_cache_misses = 0
+        self.xor_vars_avoided    = 0
+        self.xor_clauses_avoided = 0
 
     def fresh(self) -> int:
         self._count += 1
@@ -136,11 +147,20 @@ def _gate_or(a: int, b: int, out: list, alloc: _Alloc) -> int:
 
 
 def _gate_xor(a: int, b: int, out: list, alloc: _Alloc) -> int:
+    key = (a, b) if a <= b else (b, a)
+    cached = alloc._xor_cache.get(key)
+    if cached is not None:
+        alloc.xor_cache_hits += 1
+        alloc.xor_vars_avoided += 1
+        alloc.xor_clauses_avoided += 4
+        return cached
+    alloc.xor_cache_misses += 1
     y = alloc.fresh()
     out.append([-y, -a, -b])
     out.append([-y,  a,  b])
     out.append([ y, -a,  b])
     out.append([ y,  a, -b])
+    alloc._xor_cache[key] = y
     return y
 
 
@@ -946,6 +966,10 @@ def blast(formula: NsFormula, deadline: Optional[float] = None,
             eq_cache_misses=blaster.eq_cache_misses,
             eq_vars_avoided=blaster.eq_vars_avoided,
             eq_clauses_avoided=blaster.eq_clauses_avoided,
+            xor_cache_hits=a.xor_cache_hits,
+            xor_cache_misses=a.xor_cache_misses,
+            xor_vars_avoided=a.xor_vars_avoided,
+            xor_clauses_avoided=a.xor_clauses_avoided,
         )
 
     return blaster.clauses, blaster.alloc.count, blaster.var_map
