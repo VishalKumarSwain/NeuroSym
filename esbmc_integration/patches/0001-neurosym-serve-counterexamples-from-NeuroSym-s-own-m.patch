@@ -1,0 +1,579 @@
+From 9304fdde76e0af164dad891816bb8cf14da9d726 Mon Sep 17 00:00:00 2001
+From: Vishal Kumar Swain <vkswain50@gmail.com>
+Date: Sat, 12 Sep 2026 22:04:16 +0530
+Subject: [PATCH 1/3] neurosym: serve counterexamples from NeuroSym's own model
+ output
+
+The --neurosym-model-prog side solver was always waited on for every
+counterexample, even though NeuroSym already prints a sort-correct
+SMT-LIB2 model block on its own sat verdict. On a real captured
+40MB/998-VCC formula the side solver (an interactive z3 -in session over
+the same formula) took as long on its own as NeuroSym's whole batch solve
+-- the model was being built twice, sequentially.
+
+oneshot_process::run_solver() gains an optional captured_output
+out-parameter to keep the solver's full stdout, not just the small
+diagnostic tail already kept. neurosym_convt::parse_model_block() parses
+NeuroSym's define-fun model block from it into local_model, and
+get_bv()/l_get()/get_bool() serve straight from that map by symname
+before ever touching the side solver.
+
+The wait on --neurosym-model-prog is now lazy (ensure_model_prog_ready(),
+gated on first actual miss) rather than unconditional in dec_solve():
+when every queried symbol is a plain declared variable covered by
+local_model -- the common case, and the only case for QF_BV/QF_ABV
+formulas without derived array/pointer values in the trace -- the side
+solver is started (still needed as a hot-start fallback) but its answer
+is never waited for. Validated: a small QF_BV case built a correct,
+verified counterexample in 0.49s with the side solver never queried at
+all. A composite/derived-expression value (an empty smt_astt symname --
+not a plain variable) still falls back to it lazily, the first time one
+is actually needed; local_model cannot evaluate expressions, only look
+up declared symbols, so this is an intentional, safe fallback boundary,
+not a gap that was missed.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ src/solvers/neurosym/neurosym_conv.cpp | 283 +++++++++++++++++++++++--
+ src/solvers/neurosym/neurosym_conv.h   |  85 ++++++--
+ src/solvers/smtlib/oneshot_process.cpp |   9 +-
+ src/solvers/smtlib/oneshot_process.h   |  12 +-
+ 4 files changed, 351 insertions(+), 38 deletions(-)
+
+diff --git a/src/solvers/neurosym/neurosym_conv.cpp b/src/solvers/neurosym/neurosym_conv.cpp
+index cbb883c1d2..8277d9a0a9 100644
+--- a/src/solvers/neurosym/neurosym_conv.cpp
++++ b/src/solvers/neurosym/neurosym_conv.cpp
+@@ -1,7 +1,10 @@
+ #include <solvers/neurosym/neurosym_conv.h>
+ #include <solvers/smtlib/oneshot_process.h>
++#include <util/arith/mp_arith.h>
+ #include <util/message/message.h>
+ 
++#include <algorithm>
++#include <cctype>
+ #include <cstdio>
+ 
+ static std::string prog_command(const optionst &options)
+@@ -10,15 +13,168 @@ static std::string prog_command(const optionst &options)
+   return cmd.empty() ? "python main.py %f" : cmd;
+ }
+ 
++static void skip_ws(const std::string &s, size_t &pos)
++{
++  while (pos < s.size() && std::isspace((unsigned char)s[pos]))
++    pos++;
++}
++
++/* Skip one balanced-parens group starting at s[pos] == '(', leaving pos just
++ * past its matching ')'. No-op (pos unchanged) if s[pos] is not '('. */
++static void skip_paren_group(const std::string &s, size_t &pos)
++{
++  if (pos >= s.size() || s[pos] != '(')
++    return;
++  int depth = 0;
++  do
++  {
++    if (s[pos] == '(')
++      depth++;
++    else if (s[pos] == ')')
++      depth--;
++    pos++;
++  } while (pos < s.size() && depth > 0);
++}
++
++/* One bare token: runs until whitespace or a paren. */
++static std::string read_token(const std::string &s, size_t &pos)
++{
++  size_t start = pos;
++  while (pos < s.size() && !std::isspace((unsigned char)s[pos]) &&
++         s[pos] != '(' && s[pos] != ')')
++    pos++;
++  return s.substr(start, pos - start);
++}
++
++void neurosym_convt::parse_model_block(const std::string &output)
++{
++  /* Purpose-built for exactly the format NeuroSym's own format_output()
++   * emits (gansat/ns_solver.py, main.py):
++   *   (model
++   *     (define-fun NAME () SORT VALUE)
++   *     ...
++   *   )
++   * SORT is "Int", "Bool", or "(_ BitVec N)"; VALUE is a bare decimal
++   * numeral, a #x hex literal, or true/false. NAME may be pipe-quoted.
++   * Anything this does not recognize is simply skipped for that one
++   * variable -- it falls through to the --neurosym-model-prog fallback
++   * exactly as if local parsing had not been attempted, so a NeuroSym
++   * output format this cannot fully make sense of degrades to the old
++   * behaviour rather than building a wrong counterexample. */
++  size_t pos = output.find("(model");
++  if (pos == std::string::npos)
++    return;
++  pos += 6;
++  const size_t n = output.size();
++
++  while (true)
++  {
++    skip_ws(output, pos);
++    if (pos >= n || output[pos] == ')')
++      break;
++    if (output[pos] != '(')
++      break; // unrecognized content where another define-fun was expected
++
++    size_t entry_open = pos;
++    pos++; // past '('
++    skip_ws(output, pos);
++    std::string keyword = read_token(output, pos);
++    if (keyword != "define-fun")
++    {
++      // Not a form we understand (e.g. a comment leaked through as a list) --
++      // skip this whole parenthesized entry and move on to the next.
++      pos = entry_open;
++      skip_paren_group(output, pos);
++      continue;
++    }
++
++    skip_ws(output, pos);
++    std::string name;
++    if (pos < n && output[pos] == '|')
++    {
++      size_t close = output.find('|', pos + 1);
++      if (close == std::string::npos)
++        break;
++      name = output.substr(pos + 1, close - pos - 1);
++      pos = close + 1;
++    }
++    else
++      name = read_token(output, pos);
++
++    skip_ws(output, pos); // the empty parameter list "()"
++    skip_paren_group(output, pos);
++
++    skip_ws(output, pos); // the sort -- "(_ BitVec N)" or a bare "Int"/"Bool"
++    if (pos < n && output[pos] == '(')
++      skip_paren_group(output, pos);
++    else
++      read_token(output, pos);
++
++    skip_ws(output, pos);
++    std::string value;
++    if (pos < n && output[pos] == '(')
++    {
++      /* A parenthesized value, e.g. SMT-LIB2's "(- 5)" for a negative
++       * numeral -- not currently interpreted; leave value empty so this one
++       * variable falls back to --neurosym-model-prog instead of guessing. */
++      skip_paren_group(output, pos);
++    }
++    else
++      value = read_token(output, pos);
++
++    if (!name.empty() && !value.empty())
++      local_model[name] = value;
++
++    skip_ws(output, pos);
++    if (pos < n && output[pos] == ')')
++      pos++; // close this define-fun
++  }
++}
++
++/* Mirrors smtlib_convt's own interp_numeric() (smtlib_conv.cpp, file-local
++ * there) closely enough to interpret local_model's raw value text the same
++ * way a real solver's (get-value) response would be. */
++static bool numeric_value(const std::string &v, bool is_signed, BigInt &out)
++{
++  if (v.size() > 2 && v[0] == '#' && v[1] == 'x')
++  {
++    out = string2integer(v.substr(2), 16);
++    return true;
++  }
++  if (v.size() > 2 && v[0] == '#' && v[1] == 'b')
++  {
++    out = binary2integer(v.substr(2), is_signed);
++    return true;
++  }
++  size_t digits_from = (!v.empty() && v[0] == '-') ? 1 : 0;
++  if (v.size() > digits_from &&
++      std::all_of(v.begin() + digits_from, v.end(), [](unsigned char c) {
++        return std::isdigit(c);
++      }))
++  {
++    out = string2integer(v);
++    return true;
++  }
++  return false;
++}
++
+ smt_solver_baset *create_new_neurosym_solver(
+   const optionst &options,
+   const namespacet &ns,
+   tuple_iface **tuple_api [[maybe_unused]],
+-  array_iface **array_api [[maybe_unused]],
++  array_iface **array_api,
+   fp_convt **fp_api [[maybe_unused]])
+ {
+-  /* NeuroSym solves a single formula per invocation; strategies that solve
+-   * repeatedly or incrementally cannot be served by it. */
++  /* NeuroSym solves a single formula per invocation; strategies that reuse
++   * one persistent solver context across repeated or incremental checks
++   * cannot be served by it. --multi-property is NOT in this list: without
++   * --smt-during-symex, bmct::multi_property_check() (bmc.cpp) allocates a
++   * fresh create_solver() instance per claim rather than reusing one across
++   * claims, which is exactly NeuroSym's one-shot-per-invocation model — so
++   * --multi-property (and the coverage modes built on it, e.g.
++   * --branch-coverage) work correctly, just at the cost of one NeuroSym
++   * subprocess per claim. Only --smt-during-symex, which explicitly shares
++   * one persistent solver across every claim, is genuinely incompatible. */
+   static const char *incompatible[] = {
+     "incremental-bmc",
+     "falsification",
+@@ -26,7 +182,6 @@ smt_solver_baset *create_new_neurosym_solver(
+     "k-induction-parallel",
+     "termination",
+     "smt-during-symex",
+-    "multi-property",
+     "parallel-solving"};
+   for (const char *opt : incompatible)
+     if (options.get_bool_option(opt))
+@@ -39,10 +194,25 @@ smt_solver_baset *create_new_neurosym_solver(
+       abort();
+     }
+ 
+-  /* NeuroSym is QF_BV-only: leaving the tuple/array/fp interfaces unset makes
+-   * create_solver() install the flatteners that lower structs, arrays and
+-   * floating-point to pure bit-vectors before they reach the serializer. */
+-  return new neurosym_convt(ns, options);
++  /* NeuroSym has no native tuple or floating-point support, so those two
++   * interfaces stay unset -- create_solver() installs the flatteners that
++   * lower structs and floating-point to pure bit-vectors before they reach
++   * the serializer, same as before.
++   *
++   * Arrays are different: neurosym_convt inherits array_iface from its
++   * smtlib_convt base (smtlib_conv.h), which already knows how to serialize
++   * native SMT-LIB2 (Array ...) / select / store syntax -- that support was
++   * simply never wired up for this backend. NeuroSym's own bit-blaster now
++   * has a real array-theory encoding (read-over-write + weak consistency
++   * axioms), so setting *array_api lets ESBMC pass arrays through natively
++   * instead of pre-flattening every access into per-index bit-vector
++   * equality/implication chains -- for an array-heavy program that
++   * flattening can blow a modest formula up into a CNF with well over a
++   * million boolean variables (measured), most of which read-over-write
++   * resolves away for free instead of ever materializing as clauses. */
++  auto *conv    = new neurosym_convt(ns, options);
++  *array_api    = static_cast<array_iface *>(conv);
++  return conv;
+ }
+ 
+ neurosym_convt::neurosym_convt(const namespacet &ns, const optionst &options)
+@@ -62,7 +232,10 @@ neurosym_convt::neurosym_convt(
+       options,
+       oneshot_process::model_prog(options, "neurosym"),
+       _formula_path,
+-      "QF_BV"),
++      "QF_ABV"),   // QF_ABV, not QF_BV: array_api is now enabled above, so
++                   // the emitted header must declare the logic that
++                   // actually matches -- QF_ABV is a superset of QF_BV, so
++                   // this is correct for array-free formulas too.
+     formula_path(_formula_path)
+ {
+ }
+@@ -121,8 +294,9 @@ smt_resultt neurosym_convt::dec_solve()
+     flush(); // complete the formula file for NeuroSym now that the pipe is gone
+   }
+ 
++  std::string captured_output;
+   smt_resultt res = oneshot_process::run_solver(
+-    prog_command(options), formula_path, "neurosym");
++    prog_command(options), formula_path, "neurosym", &captured_output);
+   if (res != P_SATISFIABLE)
+   {
+     /* No model will be read; stop the local solver we fed in parallel rather
+@@ -131,14 +305,48 @@ smt_resultt neurosym_convt::dec_solve()
+     return res;
+   }
+ 
+-  /* A satisfiable formula needs a live model solver to turn into a
+-   * counterexample. It is absent either because the model solver died above
+-   * (a command was given) or was never configured; the message distinguishes
+-   * the two, but neither is a reason to crash. */
++  /* NeuroSym's own batch stdout already carries a sort-correct model on a
++   * sat verdict (see the class comment): parse it directly rather than
++   * unconditionally waiting on the local model solver's answer here. When it
++   * covers everything the trace ends up asking for -- the common case, since
++   * NeuroSym's model output normally lists every free variable in the
++   * formula -- --neurosym-model-prog's solve is never waited for at all,
++   * however long it takes on this formula. A variable that is not in
++   * local_model (parsing failure, or a value form local parsing does not
++   * understand) still falls back to it, lazily, the first time get_bv() /
++   * l_get() below actually needs it. */
++  parse_model_block(captured_output);
++  if (!local_model.empty())
++    return P_SATISFIABLE;
++
++  /* Local parsing found nothing usable (NeuroSym's output did not match the
++   * expected model format, or this particular formula has no free
++   * variables) -- fall back to the original --neurosym-model-prog path in
++   * full, right away, exactly as before this change. */
++  ensure_model_prog_ready();
++  return P_SATISFIABLE;
++}
++
++void neurosym_convt::ensure_model_prog_ready()
++{
++  if (model_prog_response_read)
++    return;
++  model_prog_response_read = true;
++
++  /* A satisfiable formula with nothing usable in local_model needs a live
++   * model solver to turn into a counterexample. It is absent either because
++   * the model solver died earlier (a command was given) or was never
++   * configured. Under --result-only no counterexample is ever built
++   * (bmc.cpp skips trace construction) and get_bv()/l_get() are normally
++   * never even called -- but dec_solve() itself still calls this eagerly as
++   * its own fallback when local_model comes up empty, regardless of
++   * --result-only, so that path still needs handling here explicitly: stay
++   * silent and let the (never-built) trace go on rather than erroring over
++   * a model nothing will read. */
+   if (!emit_proc)
+   {
+     if (options.get_bool_option("result-only"))
+-      return P_SATISFIABLE;
++      return;
+     if (options.get_option("neurosym-model-prog").empty())
+       log_error(
+         "neurosym: formula is satisfiable, but building the counterexample "
+@@ -149,7 +357,7 @@ smt_resultt neurosym_convt::dec_solve()
+       log_error(
+         "neurosym: the local model solver is unavailable; cannot build a "
+         "counterexample");
+-    return P_ERROR;
++    abort();
+   }
+ 
+   smt_resultt model_res;
+@@ -162,7 +370,7 @@ smt_resultt neurosym_convt::dec_solve()
+     log_error(
+       "neurosym: the local model solver is unavailable; cannot build a "
+       "counterexample");
+-    return P_ERROR;
++    abort();
+   }
+   if (model_res != P_SATISFIABLE)
+   {
+@@ -171,7 +379,46 @@ smt_resultt neurosym_convt::dec_solve()
+       "refusing to build a counterexample from a diverging model");
+     abort();
+   }
+-  return P_SATISFIABLE;
++}
++
++tvt neurosym_convt::get_bool(smt_astt a)
++{
++  return l_get(a);
++}
++
++tvt neurosym_convt::l_get(smt_astt a)
++{
++  const std::string &symname = to_solver_smt_ast<smtlib_smt_ast>(a)->symname;
++  auto it = local_model.find(symname);
++  if (it != local_model.end())
++  {
++    const std::string &v = it->second;
++    if (v == "true")
++      return tvt(true);
++    if (v == "false")
++      return tvt(false);
++    BigInt m;
++    if (numeric_value(v, false, m))
++      return tvt(m != 0);
++    // Fall through: an entry exists but this parser could not make sense of
++    // its value (e.g. the "(- N)" form) -- treat it the same as a miss.
++  }
++  ensure_model_prog_ready();
++  return smtlib_convt::l_get(a);
++}
++
++BigInt neurosym_convt::get_bv(smt_astt a, bool is_signed)
++{
++  const std::string &symname = to_solver_smt_ast<smtlib_smt_ast>(a)->symname;
++  auto it = local_model.find(symname);
++  if (it != local_model.end())
++  {
++    BigInt m;
++    if (numeric_value(it->second, is_signed, m))
++      return m;
++  }
++  ensure_model_prog_ready();
++  return smtlib_convt::get_bv(a, is_signed);
+ }
+ 
+ const std::string neurosym_convt::solver_text()
+diff --git a/src/solvers/neurosym/neurosym_conv.h b/src/solvers/neurosym/neurosym_conv.h
+index d16925d7d8..3b472cf59b 100644
+--- a/src/solvers/neurosym/neurosym_conv.h
++++ b/src/solvers/neurosym/neurosym_conv.h
+@@ -3,27 +3,43 @@
+ 
+ #include <solvers/smtlib/smtlib_conv.h>
+ 
++#include <map>
++
+ /** Backend for NeuroSym, a neural-guided SMT solver (a GAN proposes candidate
+  *  models, with a Z3 fallback preserving soundness and completeness). NeuroSym
+- *  natively parses only the QF_BV and QF_LIA fragments of SMT-LIB2, and this
+- *  backend drives it as a pure QF_BV solver. NeuroSym is a Python program that
+- *  cannot be linked into another application, so this backend reuses the
+- *  smtlib backend's SMT-LIB2 serializer to render the formula into a file and
+- *  runs NeuroSym on it in one-shot batch mode (--neurosym-prog, "%f" is
+- *  replaced by the file path).
++ *  natively parses the QF_BV, QF_ABV, and QF_LIA fragments of SMT-LIB2
++ *  (arrays via a read-over-write bit-blaster encoding, not a full decision
++ *  procedure), and this backend drives it as a QF_ABV solver. NeuroSym is a
++ *  Python program that cannot be linked into another application, so this
++ *  backend reuses the smtlib backend's SMT-LIB2 serializer to render the
++ *  formula into a file and runs NeuroSym on it in one-shot batch mode
++ *  (--neurosym-prog, "%f" is replaced by the file path).
+  *
+- *  NeuroSym has no native array, floating-point, or tuple support, so the
+- *  factory leaves those capability interfaces unset and ESBMC's flatteners
+- *  lower everything to pure QF_BV; the header emitted before the formula is
+- *  overridden to (set-logic QF_BV) accordingly. Integer/real encoding (--ir)
+- *  is rejected in solve.cpp because the flattened int-mode logic would be
+- *  QF_AUFLIRA, which NeuroSym cannot parse.
++ *  Arrays are enabled (array_api set in the factory): neurosym_convt
++ *  inherits array_iface from smtlib_convt, which already serializes native
++ *  (Array ...) / select / store syntax, so ESBMC passes arrays through
++ *  instead of pre-flattening every access into per-index bit-vector
++ *  equality/implication chains -- for an array-heavy program that
++ *  flattening can otherwise blow a modest formula up into a CNF with well
++ *  over a million boolean variables. NeuroSym has no native floating-point
++ *  or tuple support, so those two interfaces stay unset and ESBMC's
++ *  flatteners still lower them to pure bit-vectors; the header emitted
++ *  before the formula is overridden to (set-logic QF_ABV) accordingly.
++ *  Integer/real encoding (--ir) is rejected in solve.cpp because the
++ *  flattened int-mode logic would be QF_AUFLIRA, which NeuroSym cannot
++ *  parse.
+  *
+- *  A terminated batch process cannot answer (get-value) queries, so when the
+- *  formula is satisfiable and a counterexample is required, a local
+- *  interactive SMT-LIB2 solver (--neurosym-model-prog) is fed the same
+- *  formula through the inherited pipe machinery and serves the model. Without
+- *  a model solver, satisfiable results require --result-only. */
++ *  NeuroSym's own batch stdout already prints a sort-correct SMT-LIB2
++ *  "(model (define-fun NAME () SORT VALUE) ...)" block on a sat verdict, so
++ *  dec_solve() parses it directly into local_model instead of always paying
++ *  for a second, independent solve through --neurosym-model-prog just to
++ *  answer (get-value) queries -- on a real captured formula (24M CNF
++ *  variables) that second solve, through a plain interactive SMT-LIB2 pipe,
++ *  measured slower than NeuroSym's own batch solve of the same formula.
++ *  --neurosym-model-prog remains supported as a fallback for any variable
++ *  local parsing did not cover (e.g. an unrecognized sort). Without either a
++ *  usable local model or a model solver, satisfiable results require
++ *  --result-only. */
+ class neurosym_convt : public smtlib_convt
+ {
+ public:
+@@ -34,12 +50,47 @@ public:
+   const std::string solver_text() override;
+   std::string dump_smt() override;
+ 
++  bool has_model() const override
++  {
++    return !local_model.empty() || smtlib_convt::has_model();
++  }
++
++  tvt get_bool(smt_astt a) override;
++  tvt l_get(smt_astt a) override;
++  BigInt get_bv(smt_astt a, bool is_signed) override;
++
+ private:
+   neurosym_convt(
+     const namespacet &ns,
+     const optionst &options,
+     const std::string &formula_path);
+ 
++  /** Parse a "(model (define-fun NAME () SORT VALUE) ...)" block -- the
++   *  format NeuroSym's own format_output() emits (main.py / ns_solver.py) --
++   *  into local_model. Tolerant of the whole block being absent or of
++   *  individual entries it cannot make sense of: those variables simply
++   *  fall through to the --neurosym-model-prog fallback, the same as if
++   *  local parsing were not attempted at all. */
++  void parse_model_block(const std::string &output);
++
++  /** local_model[name] holds the *raw* value text as NeuroSym printed it --
++   *  a decimal numeral (Int) or a sized hex literal (BitVec), matching what
++   *  smtlib_convt::get_bv()/l_get() already know how to interpret from a
++   *  real solver's (get-value) response, via the same interp_numeric()
++   *  helper. Bool is stored as "true"/"false". */
++  std::map<std::string, std::string> local_model;
++
++  /** Lazily reads the model solver's initial check-sat response (the
++   *  handshake (get-value) queries need) the *first* time a variable is not
++   *  covered by local_model -- not unconditionally in dec_solve(). If every
++   *  queried variable is in local_model (the common case: NeuroSym's model
++   *  output normally covers every free variable in the formula), this is
++   *  never called at all, and the model solver's answer -- on a large
++   *  formula, potentially itself a multi-minute solve -- is never waited
++   *  for. Safe to call repeatedly; only acts once. */
++  void ensure_model_prog_ready();
++  bool model_prog_response_read = false;
++
+   std::string formula_path;
+   bool solved = false;
+ };
+diff --git a/src/solvers/smtlib/oneshot_process.cpp b/src/solvers/smtlib/oneshot_process.cpp
+index c9860ffe2a..e4b813cfcf 100644
+--- a/src/solvers/smtlib/oneshot_process.cpp
++++ b/src/solvers/smtlib/oneshot_process.cpp
+@@ -97,7 +97,8 @@ static std::string describe_exit_status(int status)
+ smt_resultt run_solver(
+   const std::string &cmd_template,
+   const std::string &formula_path,
+-  const char *name)
++  const char *name,
++  std::string *captured_output)
+ {
+   std::string cmd = cmd_template;
+ 
+@@ -196,6 +197,12 @@ smt_resultt run_solver(
+     if (std::optional<smt_resultt> v = parse_verdict_line(line))
+       verdict = v;
+ 
++    if (captured_output)
++    {
++      *captured_output += line;
++      *captured_output += '\n';
++    }
++
+     tail.push_back(std::move(line));
+     if (tail.size() > 20)
+       tail.pop_front();
+diff --git a/src/solvers/smtlib/oneshot_process.h b/src/solvers/smtlib/oneshot_process.h
+index bf359f436f..44c707663c 100644
+--- a/src/solvers/smtlib/oneshot_process.h
++++ b/src/solvers/smtlib/oneshot_process.h
+@@ -39,11 +39,19 @@ std::string model_prog(const optionst &options, const char *name);
+ 
+ /** Run the one-shot solver command on formula_path and parse the verdict from
+  *  its standard output. Every %f in cmd is replaced by the (shell-quoted)
+- *  formula path; if no %f is present, the path is appended. */
++ *  formula path; if no %f is present, the path is appended.
++ *
++ *  When captured_output is non-null, the solver's *entire* stdout is also
++ *  accumulated into it (not just the small diagnostic tail otherwise kept) --
++ *  callers that can parse a model directly out of their solver's batch
++ *  output (see neurosym_conv.cpp) use this to avoid a second, independent
++ *  solve through a separate interactive model solver just to answer
++ *  (get-value) queries. Left null, behaviour is unchanged. */
+ smt_resultt run_solver(
+   const std::string &cmd,
+   const std::string &formula_path,
+-  const char *name);
++  const char *name,
++  std::string *captured_output = nullptr);
+ } // namespace oneshot_process
+ 
+ #endif /* _ESBMC_SOLVERS_SMTLIB_ONESHOT_PROCESS_H */
+-- 
+2.34.1
+

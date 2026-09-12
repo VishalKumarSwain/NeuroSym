@@ -1,0 +1,83 @@
+From 768b610e9b5399ac093da86059c58216c2becfb4 Mon Sep 17 00:00:00 2001
+From: Vishal Kumar Swain <vkswain50@gmail.com>
+Date: Sat, 12 Sep 2026 22:04:16 +0530
+Subject: [PATCH 2/3] neurosym: don't fall through to a dead model solver in
+ get_bv/l_get
+
+get_bv()/l_get() called ensure_model_prog_ready() on a local_model miss
+and then unconditionally fell through to smtlib_convt::get_bv()/l_get(),
+which sends a (get-value) query to the interactive model solver (emit_proc)
+and blocks reading its response.
+
+ensure_model_prog_ready() can return having started nothing: under
+--result-only with no --neurosym-model-prog configured, it stays silent
+on purpose rather than aborting, since dec_solve() -- its only caller at
+the time it was written -- just discards the result either way. What was
+missed is that error_trace() (bmc.cpp) walks the whole trace and calls
+get_bv()/l_get() for every variable even under --result-only (that flag
+only suppresses printing the trace, not building it), so this path is
+reached for real, not just in theory.
+
+Confirmed directly: running ESBMC with --neurosym and no
+--neurosym-model-prog at all, satisfiable, --result-only, on a real
+40MB/998-VCC captured formula reproduced a genuine multi-hour hang (5+
+hours, process alive with near-zero CPU, main thread parked in
+futex_wait_queue_me) -- not a slow solve, a stuck read on a pipe with no
+writer, since emit_proc was never started.
+
+Fix: get_bv()/l_get() now check emit_proc themselves after
+ensure_model_prog_ready() returns; if it is still unusable, return a
+default (BigInt(0) / TV_UNKNOWN) instead of querying it. The value
+returned along this path is never actually consulted -- report_trace()
+only builds this trace to have something to feed the (suppressed)
+printer under --result-only -- so returning a placeholder instead of
+hanging is correct, not just safe. Verified: the same command now
+completes in ~354s (NeuroSym's own solve time, unchanged) and prints
+VERIFICATION FAILED as expected, with --neurosym-model-prog never
+started.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ src/solvers/neurosym/neurosym_conv.cpp | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/solvers/neurosym/neurosym_conv.cpp b/src/solvers/neurosym/neurosym_conv.cpp
+index 8277d9a0a9..ba053e2c6b 100644
+--- a/src/solvers/neurosym/neurosym_conv.cpp
++++ b/src/solvers/neurosym/neurosym_conv.cpp
+@@ -404,6 +404,20 @@ tvt neurosym_convt::l_get(smt_astt a)
+     // its value (e.g. the "(- N)" form) -- treat it the same as a miss.
+   }
+   ensure_model_prog_ready();
++  /* ensure_model_prog_ready() can return having done nothing -- under
++   * --result-only with no --neurosym-model-prog, it stays silent instead of
++   * aborting, since dec_solve() itself only calls it to decide whether to
++   * bail out, and never touches its result otherwise. But error_trace()
++   * still walks the whole trace and calls l_get()/get_bv() for every
++   * variable even under --result-only (only the final printing is
++   * suppressed), so this path is reached for real. Falling through to
++   * smtlib_convt::l_get() here would send a (get-value) query to emit_proc
++   * and block reading a response from a solver that was never started --
++   * confirmed as a genuine multi-hour hang, not a slow solve. The trace
++   * built along this path is never printed, so the exact value returned
++   * does not matter; unknown is honest about not having one. */
++  if (!emit_proc)
++    return tvt(tvt::TV_UNKNOWN);
+   return smtlib_convt::l_get(a);
+ }
+ 
+@@ -418,6 +432,11 @@ BigInt neurosym_convt::get_bv(smt_astt a, bool is_signed)
+       return m;
+   }
+   ensure_model_prog_ready();
++  // See the matching comment in l_get(): without a usable emit_proc this
++  // would otherwise block forever reading a (get-value) response from a
++  // solver that was never started.
++  if (!emit_proc)
++    return BigInt(0);
+   return smtlib_convt::get_bv(a, is_signed);
+ }
+ 
+-- 
+2.34.1
+
