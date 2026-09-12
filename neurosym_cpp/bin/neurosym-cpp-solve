@@ -14,7 +14,16 @@
 # contract).
 set -euo pipefail
 
-SOLVER="$HOME/VishResearch/neurosym_cpp/bitblast_solver"
+# SOLVER is resolved relative to this script's own location (bin/../),
+# not a hardcoded absolute path -- works from any checkout location,
+# not just one specific machine/user's home directory.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SOLVER="$SCRIPT_DIR/../bitblast_solver"
+
+if [ ! -x "$SOLVER" ]; then
+    echo "neurosym-cpp-solve: bitblast_solver not found or not executable at $SOLVER -- build it first: g++ -O2 -std=c++17 -o $SOLVER $SCRIPT_DIR/../bitblast_solver.cpp -lminisat" >&2
+    exit 1
+fi
 
 if [ "$#" -ne 1 ]; then
     echo "usage: neurosym-cpp-solve <formula.smt2>" >&2

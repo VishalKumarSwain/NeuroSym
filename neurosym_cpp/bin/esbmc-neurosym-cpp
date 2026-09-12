@@ -11,4 +11,28 @@
 # fast local parse cannot -- same mechanism the neurosym backend documents
 # for any solver whose batch output does not fully cover the model (see
 # --help: "z3 -in" example under --neurosym-model-prog).
-exec /home/user2/VishResearch/esbmc --neurosym   --neurosym-prog "/home/user2/bin/neurosym-cpp-solve %f"   --neurosym-model-prog "z3 -in"   "$@"
+set -euo pipefail
+
+# Both esbmc and neurosym-cpp-solve are resolved without hardcoding one
+# machine's home directory: neurosym-cpp-solve is a sibling of this script
+# (same bin/ directory) regardless of where the repo is checked out; esbmc
+# is taken from PATH first (the common case once installed), falling back
+# to a couple of conventional checkout locations if it isn't.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+NEUROSYM_PROG="$SCRIPT_DIR/neurosym-cpp-solve"
+
+if command -v esbmc >/dev/null 2>&1; then
+    ESBMC=esbmc
+elif [ -x "$HOME/VishResearch/esbmc" ]; then
+    ESBMC="$HOME/VishResearch/esbmc"
+elif [ -x "$HOME/bin/esbmc" ]; then
+    ESBMC="$HOME/bin/esbmc"
+else
+    echo "esbmc-neurosym-cpp: esbmc not found on PATH or in \$HOME/VishResearch or \$HOME/bin -- adjust this script or add esbmc to your PATH" >&2
+    exit 1
+fi
+
+exec "$ESBMC" --neurosym \
+    --neurosym-prog "$NEUROSYM_PROG %f" \
+    --neurosym-model-prog "z3 -in" \
+    "$@"
