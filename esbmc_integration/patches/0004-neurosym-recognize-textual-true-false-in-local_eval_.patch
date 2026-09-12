@@ -1,0 +1,87 @@
+From 27ce067b0851df47067da74fad3ac5f1b6de821c Mon Sep 17 00:00:00 2001
+From: Vishal Kumar Swain <vkswain50@gmail.com>
+Date: Sun, 13 Sep 2026 00:11:19 +0530
+Subject: [PATCH 4/4] neurosym: recognize textual true/false in local_eval_bool
+ SYMBOL case
+
+Investigated the reported gap where sign_extend/zero_extend composite
+expressions supposedly fall through local_eval_bv() to the external
+--neurosym-model-prog fallback. Traced a real run with temporary
+instrumentation (removed before this commit):
+
+smtlib_convt::mk_sign_ext()/mk_zero_ext() (inherited unchanged by
+neurosym_convt, which does not override them) already lower both into
+a CONCAT of the operand with either a zero bitvector (zero_extend) or
+an ITE-selected all-zero/all-one prefix keyed on an EXTRACTed top bit
+compared by EQ against 0 (sign_extend). Every node kind that lowering
+produces -- CONCAT, EXTRACT, ITE, EQ, and BVINT constants -- is already
+handled by local_eval_bv()/local_eval_bool(). A forced runtime trace
+(inline (int)c / (unsigned int)c casts on a nondet char, verified with
+diagnostic logging on the CONCAT/EXTRACT cases and on every fallthrough
+default:) confirms this directly: both cases are evaluated fully
+locally, with zero fallthrough to the default: case, and produce
+values identical to the --neurosym-model-prog "z3 -in" fallback across
+six additional differential tests spanning int8/uint8/int16/uint16
+sign_extend and zero_extend, both positive and negative. So the
+sign_extend/zero_extend gap does not exist in local_eval_bv/bool as
+currently written; no change was needed there.
+
+While forcing that runtime trace, a real, separate, and more
+fundamental gap surfaced: local_eval_bool()'s SYMBOL case calls
+local_lookup(), which only accepts numeric text via numeric_value().
+A genuinely Bool-sorted local_model entry is stored as the literal text
+"true"/"false" (as NeuroSym's own define-fun output and
+parse_model_block() emit it), so local_lookup() always missed it and
+local_eval_bool() fell through to nullopt for any boolean symbol -- in
+particular the internal execution-state/guard booleans
+(execution_statet::/bguard_exec?...) that appear in essentially every
+non-trivial VCC via IMPLIES/NOT. That silently forced every multi-VCC
+program (confirmed on test.c and div_test.c, not just contrived cases)
+out to --neurosym-model-prog for its entire trace, even though every
+other symbol involved was otherwise fully resolvable locally.
+
+Fix: handle the textual true/false form directly in the SYMBOL case
+before falling back to local_lookup()'s numeric-only parse, mirroring
+how l_get() already special-cases these two strings for a direct
+top-level symbol lookup.
+
+Validated: clean rebuild; test.c and div_test.c now build their full
+counterexample trace with --neurosym alone (no --neurosym-model-prog
+at all), byte-identical (modulo timing/PID/tmpfile-name noise) to the
+same runs with --neurosym-model-prog "z3 -in"; 6 differential
+sign_extend/zero_extend tests (int8/uint8/int16/uint16, positive and
+negative) pass with numerically correct values, identical between the
+local and z3-fallback paths in every case.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ src/solvers/neurosym/neurosym_conv.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/solvers/neurosym/neurosym_conv.cpp b/src/solvers/neurosym/neurosym_conv.cpp
+index 9b7269dec7..2311787a35 100644
+--- a/src/solvers/neurosym/neurosym_conv.cpp
++++ b/src/solvers/neurosym/neurosym_conv.cpp
+@@ -496,6 +496,19 @@ std::optional<bool> neurosym_convt::local_eval_bool(smt_astt a) const
+ 
+   case SMT_FUNC_SYMBOL:
+   {
++    // local_lookup() only understands numeric text; a genuinely Bool-sorted
++    // model entry is textual ("true"/"false"), as NeuroSym's own
++    // define-fun output and parse_model_block() emit it -- handle that form
++    // directly here rather than failing through local_lookup()'s numeric
++    // parse and forcing every boolean-guarded trace out to the external
++    // fallback solver.
++    auto it = local_model.find(ast->symname);
++    if (it == local_model.end())
++      return std::nullopt;
++    if (it->second == "true")
++      return true;
++    if (it->second == "false")
++      return false;
+     auto v = local_lookup(ast->symname);
+     if (!v)
+       return std::nullopt;
+-- 
+2.34.1
+
