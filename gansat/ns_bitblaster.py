@@ -37,6 +37,17 @@ class BlastTimeout(Exception):
     pass
 
 
+class UnsupportedBitVectorOperator(Exception):
+    """Raised when the AST contains an operator this bit-blaster has no
+    encoding for. Previously such an operator silently fell through to
+    `self.alloc.fresh_bits(w)` -- an unconstrained value with no relation
+    to the operator's actual semantics, which is unsound: a formula using
+    that value could be reported SAT (or UNSAT) based on a value that
+    doesn't mean what the formula says it means. Caught by the same
+    `except Exception` already around blast() in ns_solver.py's
+    _bv_solve(), degrading to RESULT_UNKNOWN -- an honest "can't solve
+    this", not a silently wrong answer."""
+    pass
 
 
 # ── Variable allocator ─────────────────────────────────────────────────────────
@@ -326,6 +337,112 @@ def _bv_ule(a_bits, b_bits, out, alloc) -> int:
     return _gate_not(_bv_ult(b_bits, a_bits, out, alloc), out, alloc)
 
 
+# ── Division / remainder ─────────────────────────────────────────────────────
+# Semantics match gansat/ns_evaluator.py's _bvudiv/_bvurem/_bvsdiv/_bvsrem
+# exactly (SMT-LIB2 QF_BV totalized division) -- that module was already
+# correct and used as the reference throughout this implementation and its
+# exhaustive/randomized differential tests; only the bit-blaster (which had
+# no dispatch for these four operators at all -- an unsound silent gap,
+# not a rewrite of working code) needed this.
+
+def _bv_udivrem(a_bits: List[int], b_bits: List[int],
+                out: list, alloc: _Alloc):
+    """Restoring long division, unsigned, nonzero-divisor case only --
+    the SMT-LIB divisor=0 override is applied by the four public
+    operators below, not here. Returns (quotient, remainder), both width
+    w = len(a_bits), MSB first, matching the file's existing convention.
+
+    Standard schoolbook circuit: a (w+1)-bit remainder register R starts
+    at 0; for each dividend bit (MSB to LSB), shift R left by one bringing
+    in that bit, then subtract the (zero-extended) divisor if R is large
+    enough. The loop invariant 0 <= R < b_ext holds at the start of every
+    iteration (R is only ever left less than the divisor, by
+    construction), so R's leading bit is always 0 at that point --
+    dropping it on the next left-shift (`r[1:]`) is exactly a shift-by-1
+    on a fixed-width register, not a silent truncation of anything live.
+    w+1 bits (not w) for R is what keeps a trial R-before-subtraction from
+    overflowing: R < 2*b_ext - 1 <= 2*(2^w - 1) - 1 < 2^(w+1) always."""
+    w = len(a_bits)
+    r = [_CONST_FALSE(out, alloc) for _ in range(w + 1)]
+    b_ext = [_CONST_FALSE(out, alloc)] + list(b_bits)
+    q_bits = []
+    for i in range(w):
+        r = r[1:] + [a_bits[i]]
+        ge = _gate_not(_bv_ult(r, b_ext, out, alloc), out, alloc)  # r >= b_ext ?
+        r_sub = _bv_sub(r, b_ext, out, alloc)
+        r = [_gate_ite(ge, r_sub[k], r[k], out, alloc) for k in range(w + 1)]
+        q_bits.append(ge)
+    return q_bits, r[1:]  # drop the always-zero-after-a-correct-division extension bit
+
+
+def _bv_bvudiv(a_bits: List[int], b_bits: List[int],
+               out: list, alloc: _Alloc) -> List[int]:
+    """SMT-LIB (bvudiv s t): floor(unsigned(s)/unsigned(t)) for t != 0,
+    else all-ones (matches _bvudiv in ns_evaluator.py)."""
+    w = len(a_bits)
+    q, _ = _bv_udivrem(a_bits, b_bits, out, alloc)
+    b_is_zero = _gate_not(_gate_or_n(b_bits, out, alloc), out, alloc)
+    all_ones = [_CONST_TRUE(out, alloc) for _ in range(w)]
+    return [_gate_ite(b_is_zero, all_ones[k], q[k], out, alloc) for k in range(w)]
+
+
+def _bv_bvurem(a_bits: List[int], b_bits: List[int],
+               out: list, alloc: _Alloc) -> List[int]:
+    """SMT-LIB (bvurem s t): unsigned(s) mod unsigned(t) for t != 0, else
+    s itself (matches _bvurem in ns_evaluator.py)."""
+    _, r = _bv_udivrem(a_bits, b_bits, out, alloc)
+    b_is_zero = _gate_not(_gate_or_n(b_bits, out, alloc), out, alloc)
+    return [_gate_ite(b_is_zero, a_bits[k], r[k], out, alloc) for k in range(len(a_bits))]
+
+
+def _bv_bvsdiv(a_bits: List[int], b_bits: List[int],
+               out: list, alloc: _Alloc) -> List[int]:
+    """SMT-LIB (bvsdiv s t): two's-complement signed division, truncating
+    toward zero -- computed via sign/magnitude (|s| udiv |t|, negated if
+    the operand signs differ), not Python's // (which truncates toward
+    negative infinity, the wrong direction for SMT-LIB bvsdiv). Zero
+    divisor: all-ones if s >= 0 else 1 (matches _bvsdiv in
+    ns_evaluator.py, including the MIN_SIGNED/-1 case, which correctly
+    wraps back to MIN_SIGNED here exactly as _from_signed's masking does
+    there -- both are plain fixed-width two's-complement arithmetic)."""
+    w = len(a_bits)
+    a_sign, b_sign = a_bits[0], b_bits[0]
+    a_neg, b_neg = _bv_neg(a_bits, out, alloc), _bv_neg(b_bits, out, alloc)
+    a_mag = [_gate_ite(a_sign, a_neg[k], a_bits[k], out, alloc) for k in range(w)]
+    b_mag = [_gate_ite(b_sign, b_neg[k], b_bits[k], out, alloc) for k in range(w)]
+    q_mag, _ = _bv_udivrem(a_mag, b_mag, out, alloc)
+    q_neg = _bv_neg(q_mag, out, alloc)
+    sign_differs = _gate_xor(a_sign, b_sign, out, alloc)
+    result = [_gate_ite(sign_differs, q_neg[k], q_mag[k], out, alloc) for k in range(w)]
+
+    b_is_zero = _gate_not(_gate_or_n(b_bits, out, alloc), out, alloc)
+    all_ones = [_CONST_TRUE(out, alloc) for _ in range(w)]
+    one_val  = [_CONST_FALSE(out, alloc)] * (w - 1) + [_CONST_TRUE(out, alloc)]
+    zero_case = [_gate_ite(a_sign, one_val[k], all_ones[k], out, alloc) for k in range(w)]
+    return [_gate_ite(b_is_zero, zero_case[k], result[k], out, alloc) for k in range(w)]
+
+
+def _bv_bvsrem(a_bits: List[int], b_bits: List[int],
+               out: list, alloc: _Alloc) -> List[int]:
+    """SMT-LIB (bvsrem s t): signed remainder, sign follows the dividend
+    (not bvsmod, whose sign follows the divisor) -- computed the same
+    sign/magnitude way as bvsdiv: |s| urem |t|, negated iff s is negative.
+    This is the standard truncating-remainder identity r = s - trunc(s/t)*t
+    reduced to magnitudes, matching _bvsrem in ns_evaluator.py exactly.
+    Zero divisor: s itself (matches ns_evaluator.py)."""
+    w = len(a_bits)
+    a_sign, b_sign = a_bits[0], b_bits[0]
+    a_neg, b_neg = _bv_neg(a_bits, out, alloc), _bv_neg(b_bits, out, alloc)
+    a_mag = [_gate_ite(a_sign, a_neg[k], a_bits[k], out, alloc) for k in range(w)]
+    b_mag = [_gate_ite(b_sign, b_neg[k], b_bits[k], out, alloc) for k in range(w)]
+    _, r_mag = _bv_udivrem(a_mag, b_mag, out, alloc)
+    r_neg = _bv_neg(r_mag, out, alloc)
+    result = [_gate_ite(a_sign, r_neg[k], r_mag[k], out, alloc) for k in range(w)]
+
+    b_is_zero = _gate_not(_gate_or_n(b_bits, out, alloc), out, alloc)
+    return [_gate_ite(b_is_zero, a_bits[k], result[k], out, alloc) for k in range(w)]
+
+
 def _bv_slt(a_bits: List[int], b_bits: List[int],
             out: list, alloc: _Alloc) -> int:
     """Signed a < b."""
@@ -563,6 +680,14 @@ class _Blaster:
             return _bv_sub(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
         if op == 'bvmul':
             return _bv_mul(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
+        if op == 'bvudiv':
+            return _bv_bvudiv(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
+        if op == 'bvurem':
+            return _bv_bvurem(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
+        if op == 'bvsdiv':
+            return _bv_bvsdiv(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
+        if op == 'bvsrem':
+            return _bv_bvsrem(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
         if op == 'bvneg':
             return _bv_neg(self.blast_bv(args[0]), out, alloc)
         if op == 'bvnot':
@@ -637,8 +762,9 @@ class _Blaster:
         if op == 'select':
             return self._blast_select(args[0], args[1], term.sort)
 
-        # Fallback: fresh unconstrained bits
-        return self.alloc.fresh_bits(w)
+        raise UnsupportedBitVectorOperator(
+            f"no bit-vector encoding for operator {op!r} "
+            f"(width {w}, {len(args)} args)")
 
     def blast_bool(self, term: Term) -> int:
         """Return a SAT literal for a Bool-sorted term."""
@@ -763,7 +889,16 @@ class _Blaster:
             bits = self._blast_select(args[0], args[1], BOOL)
             return bits[0]
 
-        return _CONST_TRUE(out, alloc)
+        # Found during the same audit that surfaced the missing bvudiv/
+        # bvurem/bvsdiv/bvsrem dispatch: this previously returned
+        # _CONST_TRUE(out, alloc) unconditionally for any unrecognized
+        # Boolean operator -- a fixed wrong value, not even a genuinely
+        # unconstrained one. Same fix, same reasoning as the BV-side
+        # UnsupportedBitVectorOperator: fail loudly (caught by the
+        # existing except Exception in ns_solver.py, degrading to
+        # RESULT_UNKNOWN) rather than silently assert something false.
+        raise UnsupportedBitVectorOperator(
+            f"no boolean encoding for operator {op!r} ({len(args)} args)")
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
