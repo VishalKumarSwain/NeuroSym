@@ -44,6 +44,25 @@ class BlastTimeout(Exception):
 class _Alloc:
     def __init__(self):
         self._count = 0
+        # Constant-encoding cache -- scoped to this _Alloc instance, which
+        # Blaster.__init__ creates fresh per formula solve (see blast()),
+        # so this never crosses formulas or reuses SAT variable IDs between
+        # independent CNFs. See _CONST_TRUE/_CONST_FALSE/_int_to_bits: a
+        # single canonical TRUE/FALSE literal is allocated at most once
+        # each and then reused for every constant bit in the formula,
+        # rather than allocating a fresh variable + unit clause per
+        # occurrence of every repeated BV literal.
+        self.true_lit:  Optional[int] = None
+        self.false_lit: Optional[int] = None
+        # Profiling counters -- exact, not estimated: every increment here
+        # corresponds to a real function call/allocation that did or didn't
+        # happen, not an inference from AST-level duplicate counts.
+        self.true_requests    = 0
+        self.false_requests   = 0
+        self.true_allocations = 0   # 0 or 1, ever
+        self.false_allocations = 0  # 0 or 1, ever
+        self.bv_const_requests  = 0   # total _int_to_bits() calls
+        self._unique_bv_consts: set = set()  # (width, normalized_value) seen
 
     def fresh(self) -> int:
         self._count += 1
@@ -55,6 +74,24 @@ class _Alloc:
     @property
     def count(self) -> int:
         return self._count
+
+    @property
+    def unique_bv_constants(self) -> int:
+        return len(self._unique_bv_consts)
+
+    @property
+    def constant_sat_vars_avoided(self) -> int:
+        # Every TRUE/FALSE request beyond the first is one fresh variable
+        # (and its matching unit clause) that the old code would have
+        # allocated and this one didn't.
+        return (self.true_requests - self.true_allocations) + \
+               (self.false_requests - self.false_allocations)
+
+    @property
+    def constant_clauses_avoided(self) -> int:
+        # _CONST_TRUE/_CONST_FALSE add exactly one unit clause per
+        # allocation (see their bodies) -- same count as vars avoided.
+        return self.constant_sat_vars_avoided
 
 
 # ── Tseitin gate builders ──────────────────────────────────────────────────────
@@ -125,30 +162,58 @@ def _gate_or_n(bits: List[int], out: list, alloc: _Alloc) -> int:
 
 
 def _CONST_TRUE(out: list, alloc: _Alloc) -> int:
-    v = alloc.fresh()
-    out.append([v])
-    return v
+    """Canonical TRUE literal for this formula's Blaster/_Alloc -- allocated
+    at most once (see _Alloc.__init__), every subsequent request across the
+    whole solve reuses the same SAT variable instead of allocating a fresh
+    one and a matching unit clause. Semantically identical to the old
+    always-fresh version: any variable constrained to be unconditionally
+    true is interchangeable with any other such variable, so sharing one is
+    sound by construction, not an approximation."""
+    alloc.true_requests += 1
+    if alloc.true_lit is None:
+        alloc.true_lit = alloc.fresh()
+        out.append([alloc.true_lit])
+        alloc.true_allocations += 1
+    return alloc.true_lit
 
 
 def _CONST_FALSE(out: list, alloc: _Alloc) -> int:
-    v = alloc.fresh()
-    out.append([-v])
-    return v
+    """Canonical FALSE literal -- see _CONST_TRUE's docstring; same
+    reasoning, unconditionally-false variables are interchangeable."""
+    alloc.false_requests += 1
+    if alloc.false_lit is None:
+        alloc.false_lit = alloc.fresh()
+        out.append([-alloc.false_lit])
+        alloc.false_allocations += 1
+    return alloc.false_lit
 
 
 # ── Bit-vector integer → bit list ──────────────────────────────────────────────
 
 def _int_to_bits(val: int, w: int, out: list, alloc: _Alloc) -> List[int]:
-    """Return a list of w constant literals (MSB first)."""
+    """Return a list of w constant literals (MSB first).
+
+    Composed entirely from the two canonical TRUE/FALSE literals (see
+    _CONST_TRUE/_CONST_FALSE) rather than allocating w fresh
+    constant-constrained variables per call -- every occurrence of every BV
+    literal, of any value and width, ends up referencing just those same
+    two SAT variables. Deliberately not a separate (width, value) -> bits
+    cache: composing from two already-canonical literals gets the same
+    zero-extra-allocation result with less code and no cache-key
+    normalization to get right (see the class comment on why a naive
+    value-keyed cache would still need explicit `val mod 2**w` handling).
+    Bit ordering (MSB first, i.e. index w-1 down to 0) is unchanged from
+    the prior implementation. The returned list is always a fresh object
+    (built via .append() in this call), so sharing the underlying literals
+    carries no aliasing risk even though callers may treat the list as
+    theirs to use freely."""
+    alloc.bv_const_requests += 1
+    normalized = val & ((1 << w) - 1) if w > 0 else 0
+    alloc._unique_bv_consts.add((w, normalized))
     result = []
     for i in range(w - 1, -1, -1):
-        bit = (val >> i) & 1
-        v   = alloc.fresh()
-        if bit:
-            out.append([v])
-        else:
-            out.append([-v])
-        result.append(v)
+        bit = (normalized >> i) & 1
+        result.append(_CONST_TRUE(out, alloc) if bit else _CONST_FALSE(out, alloc))
     return result
 
 
@@ -352,6 +417,23 @@ class _Blaster:
         self.var_map: Dict[str, List[int]] = {}
         self._cache: Dict[int, object] = {}   # id(term) → blasted value
         self._deadline = deadline
+        # Equality-only structural cache (measured to be worthwhile; ITE
+        # showed 0% structural duplication on every real formula tested and
+        # is deliberately NOT included here). Keyed by the operands'
+        # already-resolved SAT-level representation -- not by AST identity
+        # or a separately-computed structural AST key -- so its safety
+        # rides entirely on blast_bv()/blast_bool() already being correct
+        # (symbol interning, let-scoping, sort/width, all handled upstream
+        # by the existing, trusted machinery); two equalities are cache-
+        # equivalent here iff they compare the literal same SAT bits,
+        # which is definitionally the same equality regardless of which
+        # AST node asked for it. Scoped to this _Blaster instance, i.e. one
+        # formula/one CNF, same as _cache and _Alloc's constant cache.
+        self._eq_cache: Dict[tuple, tuple] = {}  # key -> (result, first_vars, first_clauses)
+        self.eq_cache_hits    = 0
+        self.eq_cache_misses  = 0
+        self.eq_vars_avoided    = 0
+        self.eq_clauses_avoided = 0
 
     def _check_deadline(self) -> None:
         # Checked on every blast_bv/blast_bool entry, not batched by a call
@@ -612,11 +694,39 @@ class _Blaster:
         if op == '=':
             s0 = args[0].sort
             if isinstance(s0, BVSort):
-                return _bv_eq(self.blast_bv(args[0]), self.blast_bv(args[1]), out, alloc)
+                lhs_bits = self.blast_bv(args[0])
+                rhs_bits = self.blast_bv(args[1])
+                key = ('bveq', tuple(lhs_bits), tuple(rhs_bits))
+                entry = self._eq_cache.get(key)
+                if entry is not None:
+                    self.eq_cache_hits += 1
+                    result, fv, fc = entry
+                    self.eq_vars_avoided    += fv
+                    self.eq_clauses_avoided += fc
+                    return result
+                before_v, before_c = alloc.count, len(out)
+                result = _bv_eq(lhs_bits, rhs_bits, out, alloc)
+                self._eq_cache[key] = (
+                    result, alloc.count - before_v, len(out) - before_c)
+                self.eq_cache_misses += 1
+                return result
             elif isinstance(s0, BoolSort):
                 a_ = self.blast_bool(args[0])
                 b_ = self.blast_bool(args[1])
-                return _gate_not(_gate_xor(a_, b_, out, alloc), out, alloc)
+                key = ('booleq', a_, b_)
+                entry = self._eq_cache.get(key)
+                if entry is not None:
+                    self.eq_cache_hits += 1
+                    result, fv, fc = entry
+                    self.eq_vars_avoided    += fv
+                    self.eq_clauses_avoided += fc
+                    return result
+                before_v, before_c = alloc.count, len(out)
+                result = _gate_not(_gate_xor(a_, b_, out, alloc), out, alloc)
+                self._eq_cache[key] = (
+                    result, alloc.count - before_v, len(out) - before_c)
+                self.eq_cache_misses += 1
+                return result
             else:
                 return _CONST_TRUE(out, alloc)
 
@@ -658,14 +768,22 @@ class _Blaster:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def blast(formula: NsFormula, deadline: Optional[float] = None):
+def blast(formula: NsFormula, deadline: Optional[float] = None,
+          stats_out: Optional[dict] = None):
     """
     Bit-blast a QF_BV / QF_ABV formula.
-    Returns (clauses, n_vars, var_map).
+    Returns (clauses, n_vars, var_map) -- unchanged contract, existing
+    callers are unaffected.
     Raises BlastTimeout if `deadline` (an absolute time.time() value) is
     given and exceeded before blasting finishes -- checked on every
     not-yet-cached term visited via blast_bv/blast_bool. A cache hit skips
     the check: it does no new work, so it can't be what overruns a deadline.
+
+    `stats_out`, when given a dict, is populated (in place) with the
+    constant-encoding counters from this solve's _Alloc -- profiling-only,
+    exact counts (not estimates): true_requests, false_requests,
+    true_allocations, false_allocations, bv_const_requests,
+    unique_bv_constants, constant_sat_vars_avoided, constant_clauses_avoided.
     """
     blaster = _Blaster(deadline=deadline)
     top_lits = []
@@ -677,6 +795,23 @@ def blast(formula: NsFormula, deadline: Optional[float] = None):
     # Assert all top-level literals to be True
     for lit in top_lits:
         blaster.clauses.append([lit])
+
+    if stats_out is not None:
+        a = blaster.alloc
+        stats_out.update(
+            true_requests=a.true_requests,
+            false_requests=a.false_requests,
+            true_allocations=a.true_allocations,
+            false_allocations=a.false_allocations,
+            bv_const_requests=a.bv_const_requests,
+            unique_bv_constants=a.unique_bv_constants,
+            constant_sat_vars_avoided=a.constant_sat_vars_avoided,
+            constant_clauses_avoided=a.constant_clauses_avoided,
+            eq_cache_hits=blaster.eq_cache_hits,
+            eq_cache_misses=blaster.eq_cache_misses,
+            eq_vars_avoided=blaster.eq_vars_avoided,
+            eq_clauses_avoided=blaster.eq_clauses_avoided,
+        )
 
     return blaster.clauses, blaster.alloc.count, blaster.var_map
 
