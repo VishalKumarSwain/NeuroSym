@@ -1,0 +1,14 @@
+#!/bin/bash
+# NeuroSym backend for ESBMC, using the experimental C++ bit-blast/MiniSat
+# solver (neurosym_cpp/bitblast_solver) instead of the Python pipeline for
+# the sat/unsat decision. bitblast_solver now parses SMT-LIB2 natively (see
+# neurosym_cpp/smt2_parser.inc), so neurosym-cpp-solve is pure shell -- no
+# Python anywhere in this path anymore (dump_ir.py's JSON-IR dump step has
+# been removed). Its local model output does not cover every composite-
+# expression op the trace builder can ask for (e.g. sign_extend/zero_extend
+# nodes), so --neurosym-model-prog "z3 -in" is kept as the fallback local
+# interactive solver ESBMC uses to fill in the counterexample whenever the
+# fast local parse cannot -- same mechanism the neurosym backend documents
+# for any solver whose batch output does not fully cover the model (see
+# --help: "z3 -in" example under --neurosym-model-prog).
+exec /home/user2/VishResearch/esbmc --neurosym   --neurosym-prog "/home/user2/bin/neurosym-cpp-solve %f"   --neurosym-model-prog "z3 -in"   "$@"

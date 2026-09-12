@@ -1,0 +1,56 @@
+#!/bin/bash
+# Wrapper invoked by ESBMC's --neurosym-prog with a single argument: the
+# path to the SMT-LIB2 formula file (ESBMC's %f substitution).
+#
+# Pure shell, zero Python: bitblast_solver now parses SMT-LIB2 natively
+# (own tokenizer/parser in neurosym_cpp/smt2_parser.inc), so there is no
+# JSON-IR dump step anymore. bitblast_solver's --model-sorts flag makes it
+# print each model line as "name = value : SORT" directly, so this wrapper
+# doesn't need separate declare-fun metadata (previously supplied by
+# /tmp/dump_ir.py) to build ESBMC's "(model (define-fun NAME () SORT
+# VALUE)...)" block -- it only has to reformat lines already emitted by the
+# solver, plus print the verdict line verbatim (already matches
+# oneshot_process::parse_verdict_line's exact "sat"/"unsat"/"unknown"
+# contract).
+set -euo pipefail
+
+SOLVER="$HOME/VishResearch/neurosym_cpp/bitblast_solver"
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: neurosym-cpp-solve <formula.smt2>" >&2
+    exit 1
+fi
+formula_path="$1"
+
+out="$("$SOLVER" "$formula_path" --model-sorts --smtlib 2>/tmp/neurosym-cpp-solve.stderr)" || {
+    echo "unknown"
+    cat /tmp/neurosym-cpp-solve.stderr >&2
+    exit 0
+}
+
+# Avoid piping $out into `head`/`tail` -- for large models that stalls the
+# reader early and SIGPIPEs the writer end (bash's `printf ... | head -1`),
+# which under `set -e -o pipefail` aborts the whole script. Split on
+# newlines with pure parameter expansion / a here-string instead.
+verdict="${out%%$'\n'*}"
+echo "$verdict"
+
+if [ "$verdict" = "sat" ]; then
+    echo "(model"
+    rest_lines="${out#*$'\n'}"
+    while IFS= read -r line; do
+        case "$line" in
+            *" = "*" : "*)
+                name="${line%% = *}"
+                tail_part="${line#* = }"
+                val="${tail_part%% : *}"
+                sort="${tail_part#* : }"
+                echo "  (define-fun $name () $sort $val)"
+                ;;
+            *"<unreferenced>"*)
+                : # no metadata to emit a sort for -- skip, same as before
+                ;;
+        esac
+    done <<< "$rest_lines"
+    echo ")"
+fi
