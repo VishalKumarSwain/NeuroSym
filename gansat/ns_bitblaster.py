@@ -621,51 +621,88 @@ class _Blaster:
         Bottoms out at a genuine array variable (or any other opaque
         array-valued term), where consistency with every previously
         resolved select against that same array is enforced by the weak
-        array axiom: idx_i == idx_j -> value_i == value_j."""
+        array axiom: idx_i == idx_j -> value_i == value_j.
+
+        Implementation note: every recursive call along a store/ite chain
+        carries the *same* idx_term/elem_sort -- only arr_term changes as
+        we walk down the chain -- so the whole chain is really a tree walk
+        over arr_term alone. That walk is done here with an explicit
+        worklist/stack instead of Python-level recursion: on real
+        array-heavy formulas a single array can accumulate thousands of
+        nested stores, and Python recursion there previously grew the
+        actual C call stack (several C frames per Python frame here, for
+        the list comprehension, _bv_eq, _gate_ite, etc.) well past what
+        the process stack can hold -- segfaulting before Python's own
+        recursion-limit safety check could ever fire. An iterative walk
+        has no depth ceiling tied to the chain length."""
         out   = self.clauses
         alloc = self.alloc
         width = elem_sort.width if isinstance(elem_sort, BVSort) else 1
 
-        if isinstance(arr_term, App) and arr_term.op == 'store':
-            a0, i0, v0 = arr_term.args
-            idx_bits  = self.blast_bv(idx_term)
-            i0_bits   = self.blast_bv(i0)
-            eq        = _bv_eq(idx_bits, i0_bits, out, alloc)
-            then_bits = self._blast_value(v0, elem_sort)
-            else_bits = self._blast_select(a0, idx_term, elem_sort)
-            return [_gate_ite(eq, then_bits[k], else_bits[k], out, alloc)
-                    for k in range(width)]
+        idx_bits = self.blast_bv(idx_term)
 
-        if isinstance(arr_term, App) and arr_term.op == 'as_const':
-            # Constant array: every index maps to the same value.
-            return self._blast_value(arr_term.args[0], elem_sort)
+        results: Dict[int, List[int]] = {}
+        stack: List[Tuple[Term, bool]] = [(arr_term, False)]
+        while stack:
+            node, expanded = stack.pop()
+            key = id(node)
+            if key in results:
+                continue
 
-        if isinstance(arr_term, App) and arr_term.op == 'ite':
-            cond   = self.blast_bool(arr_term.args[0])
-            t_bits = self._blast_select(arr_term.args[1], idx_term, elem_sort)
-            e_bits = self._blast_select(arr_term.args[2], idx_term, elem_sort)
-            return [_gate_ite(cond, t_bits[k], e_bits[k], out, alloc)
-                    for k in range(width)]
+            if isinstance(node, App) and node.op == 'store':
+                a0, i0, v0 = node.args
+                if not expanded:
+                    stack.append((node, True))
+                    stack.append((a0, False))
+                    continue
+                else_bits = results[id(a0)]
+                i0_bits   = self.blast_bv(i0)
+                eq        = _bv_eq(idx_bits, i0_bits, out, alloc)
+                then_bits = self._blast_value(v0, elem_sort)
+                results[key] = [_gate_ite(eq, then_bits[k], else_bits[k], out, alloc)
+                                 for k in range(width)]
+                continue
 
-        # Base case: an opaque array (a Var, or any other term we don't
-        # peel further). Key by variable name, not id(term) -- the parser
-        # builds a fresh Var object per occurrence, so two selects on "the
-        # same array" are different objects sharing a .name.
-        key = arr_term.name if isinstance(arr_term, Var) else f"#anon{id(arr_term)}"
-        idx_bits    = self.blast_bv(idx_term)
-        result_bits = alloc.fresh_bits(width)
+            if isinstance(node, App) and node.op == 'as_const':
+                # Constant array: every index maps to the same value.
+                results[key] = self._blast_value(node.args[0], elem_sort)
+                continue
 
-        prior = self._array_reads.setdefault(key, [])
-        for prev_idx_bits, prev_result_bits in prior:
-            idx_eq = _bv_eq(idx_bits, prev_idx_bits, out, alloc)
-            for k in range(width):
-                val_eq = _gate_not(
-                    _gate_xor(result_bits[k], prev_result_bits[k], out, alloc),
-                    out, alloc)
-                out.append([-idx_eq, val_eq])   # idx_i==idx_j -> bit_k equal
-        prior.append((idx_bits, result_bits))
+            if isinstance(node, App) and node.op == 'ite':
+                t_term, e_term = node.args[1], node.args[2]
+                if not expanded:
+                    stack.append((node, True))
+                    stack.append((e_term, False))
+                    stack.append((t_term, False))
+                    continue
+                cond   = self.blast_bool(node.args[0])
+                t_bits = results[id(t_term)]
+                e_bits = results[id(e_term)]
+                results[key] = [_gate_ite(cond, t_bits[k], e_bits[k], out, alloc)
+                                 for k in range(width)]
+                continue
 
-        return result_bits
+            # Base case: an opaque array (a Var, or any other term we
+            # don't peel further). Key by variable name, not id(term) --
+            # the parser builds a fresh Var object per occurrence, so two
+            # selects on "the same array" are different objects sharing a
+            # .name.
+            arr_key = node.name if isinstance(node, Var) else f"#anon{id(node)}"
+            result_bits = alloc.fresh_bits(width)
+
+            prior = self._array_reads.setdefault(arr_key, [])
+            for prev_idx_bits, prev_result_bits in prior:
+                idx_eq = _bv_eq(idx_bits, prev_idx_bits, out, alloc)
+                for k in range(width):
+                    val_eq = _gate_not(
+                        _gate_xor(result_bits[k], prev_result_bits[k], out, alloc),
+                        out, alloc)
+                    out.append([-idx_eq, val_eq])   # idx_i==idx_j -> bit_k equal
+            prior.append((idx_bits, result_bits))
+
+            results[key] = result_bits
+
+        return results[id(arr_term)]
 
     def blast_bv(self, term: Term) -> List[int]:
         """Return list of SAT literals (MSB first) representing BV term."""

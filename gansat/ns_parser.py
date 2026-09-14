@@ -217,8 +217,82 @@ def _infer_sort(op: str, params: tuple, args: List[Term]) -> Sort:
 
 
 def _parse_term(st: _Stream, env: Dict[str, Term]) -> Term:
-    t = st.peek()
+    # ── let-chain flattening ─────────────────────────────────────────────
+    # A real ESBMC-merged dump nests lets hundreds of thousands deep in a
+    # single assert (each subexpression gets its own let, chained:
+    # (let ((?x0 ..)) (let ((?x1 ..)) .. body))). Recursing into the body
+    # via _parse_term once per let -- as this function used to -- makes
+    # Python-recursion depth track let-nesting depth directly, and on
+    # formulas like that it blows the real C stack (multiple C frames per
+    # Python frame here) well before Python's own recursion-limit check
+    # can catch it -- a confirmed segfault (signal 11), not a clean
+    # RecursionError. This outer loop walks the let-chain iteratively --
+    # entering each nested let's scope without a recursive call -- and
+    # only recurses (via the helper below) once it reaches a genuinely
+    # non-let body, or while parsing a let's own bound *value* expressions
+    # (those are siblings, not part of the chain, and are bounded by
+    # ordinary expression depth, not let-nesting depth).
+    pending_closes = 0
+    while True:
+        t = st.peek()
+        if t != '(':
+            result = _parse_atom(st, env, t)
+            break
+        st.pop()  # '('
+        head = st.peek()
+        if head == ')':
+            st.pop()
+            result = TRUE
+            break
+        if head == 'let':
+            st.pop()  # 'let'
+            st.expect('(')
+            bindings = {}
+            while st.peek() != ')':
+                st.expect('(')
+                name = st.pop()
+                val  = _parse_term(st, env)
+                st.expect(')')
+                bindings[name] = val
+            st.expect(')')
+            # ChainMap instead of {**env, **bindings}: the latter copies the
+            # entire outer scope on every single let -- fine for a handful of
+            # lets, but a real ESBMC-merged multi-property dump can carry
+            # 500K+ of them over an env that has grown to thousands of entries
+            # (every declare-fun/define-fun seen so far). Copying that dict
+            # half a million times is the dominant cost by far at that scale --
+            # measured on a real 40MB/998-VCC formula, token-processing
+            # throughput degraded from ~95K tok/s down to ~4.5K tok/s over the
+            # first 30% of the file and was still falling, a textbook O(n^2)
+            # signature. ChainMap makes each let O(1) to enter: only the new
+            # bindings get a fresh dict, and lookups check bindings first, env
+            # second -- same lexical-scoping semantics, no copy.
+            #
+            # ChainMap(bindings, env) alone is not enough when lets are deeply
+            # chained (as they are here -- 500K+ of them, often nested tens of
+            # thousands deep): if env is *itself* already a ChainMap, wrapping
+            # it as one element of a new ChainMap nests ChainMaps inside
+            # ChainMaps, and a lookup then recurses through __contains__ once
+            # per nesting level -- hits RecursionError on real input, confirmed
+            # directly. Flattening into env.maps instead keeps a single flat
+            # maps list regardless of how many lets deep we are: lookups stay
+            # a plain iteration (no recursive calls), and get one dict longer
+            # per let instead of one nesting level deeper.
+            if isinstance(env, ChainMap):
+                env = ChainMap(bindings, *env.maps)
+            else:
+                env = ChainMap(bindings, env)
+            pending_closes += 1
+            continue  # iterate into the body -- no recursive call, no stack growth
+        result = _parse_compound(st, env, head)
+        break
 
+    for _ in range(pending_closes):
+        st.expect(')')
+    return result
+
+
+def _parse_atom(st: _Stream, env: Dict[str, Term], t) -> Term:
     # BV literal token
     if isinstance(t, tuple) and t[0] == 'bvlit':
         st.pop()
@@ -230,77 +304,30 @@ def _parse_term(st: _Stream, env: Dict[str, Term]) -> Term:
         return TRUE
 
     # Atom: true, false, numeral, symbol
-    if t != '(':
-        st.pop()
-        if t == 'true':  return TRUE
-        if t == 'false': return FALSE
-        # Negative numeral presented as two tokens in some files; here it's
-        # always a single string starting with digit or '-'
-        if isinstance(t, str):
-            # pure integer
-            try:
-                return IntLit(int(t))
-            except ValueError:
-                pass
-            # variable reference or let-bound name
-            if t in env:
-                return env[t]
-            # unknown symbol — return a Bool placeholder
-            return Var(t, BOOL)
-        return TRUE
+    st.pop()
+    if t == 'true':  return TRUE
+    if t == 'false': return FALSE
+    # Negative numeral presented as two tokens in some files; here it's
+    # always a single string starting with digit or '-'
+    if isinstance(t, str):
+        # pure integer
+        try:
+            return IntLit(int(t))
+        except ValueError:
+            pass
+        # variable reference or let-bound name
+        if t in env:
+            return env[t]
+        # unknown symbol — return a Bool placeholder
+        return Var(t, BOOL)
+    return TRUE
 
-    # Compound S-expression: ( head ... )
-    st.pop()  # '('
-    head = st.peek()
 
-    # Empty list — treat as true
-    if head == ')':
-        st.pop()
-        return TRUE
-
-    # ── let binding ─────────────────────────────────────────────────────────
-    if head == 'let':
-        st.pop()  # 'let'
-        st.expect('(')
-        bindings = {}
-        while st.peek() != ')':
-            st.expect('(')
-            name = st.pop()
-            val  = _parse_term(st, env)
-            st.expect(')')
-            bindings[name] = val
-        st.expect(')')
-        # ChainMap instead of {**env, **bindings}: the latter copies the
-        # entire outer scope on every single let -- fine for a handful of
-        # lets, but a real ESBMC-merged multi-property dump can carry
-        # 500K+ of them over an env that has grown to thousands of entries
-        # (every declare-fun/define-fun seen so far). Copying that dict
-        # half a million times is the dominant cost by far at that scale --
-        # measured on a real 40MB/998-VCC formula, token-processing
-        # throughput degraded from ~95K tok/s down to ~4.5K tok/s over the
-        # first 30% of the file and was still falling, a textbook O(n^2)
-        # signature. ChainMap makes each let O(1) to enter: only the new
-        # bindings get a fresh dict, and lookups check bindings first, env
-        # second -- same lexical-scoping semantics, no copy.
-        #
-        # ChainMap(bindings, env) alone is not enough when lets are deeply
-        # chained (as they are here -- 500K+ of them, often nested tens of
-        # thousands deep): if env is *itself* already a ChainMap, wrapping
-        # it as one element of a new ChainMap nests ChainMaps inside
-        # ChainMaps, and a lookup then recurses through __contains__ once
-        # per nesting level -- hits RecursionError on real input, confirmed
-        # directly. Flattening into env.maps instead keeps a single flat
-        # maps list regardless of how many lets deep we are: lookups stay
-        # a plain iteration (no recursive calls), and get one dict longer
-        # per let instead of one nesting level deeper.
-        if isinstance(env, ChainMap):
-            new_env = ChainMap(bindings, *env.maps)
-        else:
-            new_env = ChainMap(bindings, env)
-        body = _parse_term(st, new_env)
-        st.expect(')')
-        return body
-
+def _parse_compound(st: _Stream, env: Dict[str, Term], head) -> Term:
+    """Parse the rest of a compound S-expression `( head ... )` whose '('
+    has already been popped and whose head token is `head` -- i.e.
+    everything _parse_term used to handle after ruling out 'let' (let is
+    handled iteratively by the caller's loop, above)."""
     # ── forall / exists — skip quantifiers (not QF) ─────────────────────────
     if head in ('forall', 'exists'):
         st.pop()
@@ -419,11 +446,18 @@ def _parse_term(st: _Stream, env: Dict[str, Term]) -> Term:
 # ── Top-level command parser ───────────────────────────────────────────────────
 
 def _collect_vars(term: Term, seen: Dict[str, Var]):
-    if isinstance(term, Var):
-        seen[term.name] = term
-    elif isinstance(term, App):
-        for a in term.args:
-            _collect_vars(a, seen)
+    # Iterative (explicit worklist) rather than recursive: a deeply nested
+    # App tree (e.g. a long store/ite chain over one array, thousands of
+    # levels deep in real ESBMC-generated formulas) would otherwise blow
+    # the Python/C stack here just like the parser's own former let-chain
+    # recursion did -- see _parse_term's note above.
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        if isinstance(t, Var):
+            seen[t.name] = t
+        elif isinstance(t, App):
+            stack.extend(t.args)
 
 
 def parse_string(smtlib_str: str) -> NsFormula:
