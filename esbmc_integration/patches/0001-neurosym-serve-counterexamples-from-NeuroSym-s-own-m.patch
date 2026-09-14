@@ -1,4 +1,4 @@
-From 9304fdde76e0af164dad891816bb8cf14da9d726 Mon Sep 17 00:00:00 2001
+From 6669c07e2259dd6fe540073c3c2dd364ffd079a7 Mon Sep 17 00:00:00 2001
 From: Vishal Kumar Swain <vkswain50@gmail.com>
 Date: Sat, 12 Sep 2026 22:04:16 +0530
 Subject: [PATCH 1/4] neurosym: serve counterexamples from NeuroSym's own model

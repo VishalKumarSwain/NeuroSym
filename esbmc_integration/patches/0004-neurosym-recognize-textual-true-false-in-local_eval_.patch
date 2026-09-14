@@ -1,4 +1,4 @@
-From 27ce067b0851df47067da74fad3ac5f1b6de821c Mon Sep 17 00:00:00 2001
+From c5f30c77a2c45385077286c0adcd920a13b93f9a Mon Sep 17 00:00:00 2001
 From: Vishal Kumar Swain <vkswain50@gmail.com>
 Date: Sun, 13 Sep 2026 00:11:19 +0530
 Subject: [PATCH 4/4] neurosym: recognize textual true/false in local_eval_bool

@@ -1,4 +1,4 @@
-From 768b610e9b5399ac093da86059c58216c2becfb4 Mon Sep 17 00:00:00 2001
+From e71eac61f0db644ca44dadb15c52b1e17e435822 Mon Sep 17 00:00:00 2001
 From: Vishal Kumar Swain <vkswain50@gmail.com>
 Date: Sat, 12 Sep 2026 22:04:16 +0530
 Subject: [PATCH 2/4] neurosym: don't fall through to a dead model solver in

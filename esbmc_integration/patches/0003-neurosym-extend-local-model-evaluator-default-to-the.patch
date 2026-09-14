@@ -1,4 +1,4 @@
-From 90ade9a386e15b2c7aa8d34235688c7c987c1ca2 Mon Sep 17 00:00:00 2001
+From aef64c777928d54fa7aa8b42ba8e0274f0350b35 Mon Sep 17 00:00:00 2001
 From: Vishal Kumar Swain <vkswain50@gmail.com>
 Date: Sat, 12 Sep 2026 22:04:16 +0530
 Subject: [PATCH 3/4] neurosym: extend local model evaluator, default to the
@@ -28,10 +28,10 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
  3 files changed, 598 insertions(+), 35 deletions(-)
 
 diff --git a/src/esbmc/options.cpp b/src/esbmc/options.cpp
-index 2d02c3544a..2afc0622c1 100644
+index 15fef704ed..42d3506ab2 100644
 --- a/src/esbmc/options.cpp
 +++ b/src/esbmc/options.cpp
-@@ -624,7 +624,7 @@ const struct group_opt_templ all_cmd_options[] = {
+@@ -673,7 +673,7 @@ const struct group_opt_templ all_cmd_options[] = {
      {"neurosym-prog",
       boost::program_options::value<std::string>()->value_name("<cmd>"),
       "Command running NeuroSym on an SMT-LIB2 file; every %f is replaced by "
