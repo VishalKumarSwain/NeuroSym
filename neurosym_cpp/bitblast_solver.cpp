@@ -792,6 +792,87 @@ static std::vector<int> extractBits(Blaster &bl, std::vector<Node> &nodes, IRRes
     return out;
 }
 
+// Recognize a node that is a compile-time BV constant, EVEN IF it is not
+// a bare bvlit -- real ESBMC output routinely buries a genuine constant
+// under its own sign-extension-via-ITE-and-concat encoding (e.g. a
+// 32-bit -1 widened to 64 bits for an overflow check becomes
+// concat(ite(sign-cond, 0, ones), bvneg(1)), not a plain bvlit). Found
+// directly from a real corpus slowdown: bvmul's power-of-2/identity fast
+// path was blind to exactly this shape, silently falling through to the
+// general O(w^2) multiplier + overflow logic on what is genuinely a
+// constant multiply. Handles: bvlit directly; bvneg/bvnot of a constant;
+// concat of two constants; extract of a constant; ite with a boollit
+// condition (picks the constant branch, recursing -- both branches need
+// not themselves be constant, only the live one, matching how the ite
+// folding elsewhere in this file already reasons about it). Returns
+// nullopt (via the bool out-param) for anything else -- a real variable
+// reference or an expression this function does not recognize -- rather
+// than guessing.
+static bool tryConstEvalBool(std::vector<Node> &nodes, int nid, bool &outVal);
+static bool tryConstEval(std::vector<Node> &nodes, int nid, uint64_t &outVal, int &outWidth) {
+    Node &n = nodes[nid];
+    if (n.op == "bvlit") {
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        outVal = (uint64_t)n.value & mask;
+        outWidth = w;
+        return true;
+    }
+    if (n.op == "bvneg" || n.op == "bvnot") {
+        uint64_t v; int w;
+        if (!tryConstEval(nodes, n.args[0], v, w)) return false;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        outVal = (n.op == "bvneg" ? (uint64_t)(-(int64_t)v) : ~v) & mask;
+        outWidth = w;
+        return true;
+    }
+    if (n.op == "concat") {
+        uint64_t hiV, loV; int hiW, loW;
+        if (!tryConstEval(nodes, n.args[0], hiV, hiW)) return false;
+        if (!tryConstEval(nodes, n.args[1], loV, loW)) return false;
+        if (hiW + loW > 64) return false; // outside what a uint64_t can represent
+        outVal = (hiV << loW) | loV;
+        outWidth = hiW + loW;
+        return true;
+    }
+    if (n.op == "extract") {
+        uint64_t v; int w;
+        if (!tryConstEval(nodes, n.args[0], v, w)) return false;
+        long long hi = n.params[0], lo = n.params[1];
+        int ew = (int)(hi - lo + 1);
+        uint64_t emask = (ew >= 64) ? ~0ULL : ((1ULL << ew) - 1);
+        outVal = (v >> lo) & emask;
+        outWidth = ew;
+        return true;
+    }
+    if (n.op == "ite") {
+        bool cond;
+        if (!tryConstEvalBool(nodes, n.args[0], cond)) return false;
+        int branch = cond ? n.args[1] : n.args[2];
+        return tryConstEval(nodes, branch, outVal, outWidth);
+    }
+    return false;
+}
+
+// Companion boolean-sorted constant evaluator, mutually recursive with
+// tryConstEval above -- needed because a real sign-extension-via-ite
+// condition is routinely a compound expression like "(= (extract 31 31
+// x) #b0)" (a sign-bit test), not a bare boollit, so tryConstEval's ite
+// case cannot resolve without being able to fold THIS too. Handles:
+// boollit directly; = between two BV constant-foldable operands.
+static bool tryConstEvalBool(std::vector<Node> &nodes, int nid, bool &outVal) {
+    Node &n = nodes[nid];
+    if (n.op == "boollit") { outVal = n.boolValue; return true; }
+    if (n.op == "=" && n.args.size() == 2 && !nodes[n.args[0]].isArray) {
+        uint64_t a, b; int wa, wb;
+        if (!tryConstEval(nodes, n.args[0], a, wa)) return false;
+        if (!tryConstEval(nodes, n.args[1], b, wb)) return false;
+        outVal = (a == b);
+        return true;
+    }
+    return false;
+}
+
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
     auto it = res.bvCache.find(nid);
     if (it != res.bvCache.end()) return it->second;
@@ -846,15 +927,26 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
         uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
         bool handled = false;
         for (int side = 0; side < 2 && !handled; side++) {
-            Node &constNode = nodes[n.args[side]];
             int otherArg = n.args[1 - side];
-            if (constNode.op != "bvlit") continue;
-            uint64_t cv = (uint64_t)constNode.value & mask;
+            uint64_t cv; int cw;
+            if (!tryConstEval(nodes, n.args[side], cv, cw)) continue;
+            cv &= mask;
             if (cv == 0) {
                 out = bl.int_to_bits(0, w);
                 handled = true;
             } else if (cv == 1) {
                 out = blastBV(bl, nodes, res, otherArg);
+                handled = true;
+            } else if (cv == mask) {
+                // cv == mask (all-ones) is -1 in two-s-complement: x * -1
+                // = -x. Not a power of 2 in the unsigned bit pattern, so
+                // this needs its own case -- found via a real corpus
+                // slowdown (simplifier-mult-fail, x * (-1) with overflow
+                // checking): without it, this falls to the general O(w^2)
+                // schoolbook multiplier plus overflow-detection logic on
+                // top, ~30s+ on a case z3 solves in 0.17s by recognizing
+                // the same algebraic identity.
+                out = bl.bv_neg(blastBV(bl, nodes, res, otherArg));
                 handled = true;
             } else {
                 int k;
