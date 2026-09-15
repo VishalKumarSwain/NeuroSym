@@ -13,10 +13,13 @@
 // ((_ repeat n) x), ite, and the ignorable commands set-logic/set-info/
 // set-option/push/pop/check-sat/get-model/get-value/exit.
 //
-// Known gaps (see report): array theory (select/store) is not specially
-// handled -- none of the project's real QF_ABV formulas actually use it
-// (confirmed by grep), so this is untested; quantifiers (forall/exists) are
-// skipped structurally like ns_parser.py does (not expected in QF_* logics).
+// Array theory: (Array (_ BitVec I) (_ BitVec E)) and Bool-valued-element
+// arrays, select/store, and ((as const (Array I E)) v) are supported via a
+// read-over-write encoding at bit-blast time (see blastSelect in
+// bitblast_solver.cpp) -- ported from gansat/ns_bitblaster.py's
+// _blast_select, including its iterative (non-recursive) store/ite-chain
+// walk. Quantifiers (forall/exists) are skipped structurally like
+// ns_parser.py does (not expected in QF_* logics).
 
 #include <unordered_set>
 
@@ -129,7 +132,17 @@ struct S2Stream {
 
 // ── sort parsing: only Bool / (_ BitVec N) matter for bit-blasting ────────
 
-struct S2Sort { bool isBool; int width; };
+struct S2Sort {
+    bool isBool = false;
+    int width = -1;
+    // Array theory: isArray marks (Array (_ BitVec idxWidth) ELEM), with
+    // ELEM described by elemIsBool/elemWidth the same way a scalar sort
+    // would be (elemWidth meaningless when elemIsBool).
+    bool isArray = false;
+    int idxWidth = -1;
+    bool elemIsBool = false;
+    int elemWidth = -1;
+};
 
 static S2Sort smt2ParseSort(S2Stream &st) {
     const S2Token &t = st.peek();
@@ -146,12 +159,19 @@ static S2Sort smt2ParseSort(S2Stream &st) {
             st.skipBalanced(); // consumes remaining tokens incl. the RP we already owe
             return {false, 1};
         } else if (head.kind == S2Token::SYM && head.text == "Array") {
-            // Array sort: not bit-blastable; skip index/elem sorts and mark
-            // unsupported by returning a sentinel the caller rejects.
-            smt2ParseSort(st);
-            smt2ParseSort(st);
+            S2Sort idxS = smt2ParseSort(st);
+            S2Sort elemS = smt2ParseSort(st);
             st.expectRP();
-            throw std::runtime_error("smt2 parser: Array sort not supported by bit-blast backend");
+            if (idxS.isArray || idxS.isBool)
+                throw std::runtime_error("smt2 parser: only BitVec-indexed arrays supported");
+            if (elemS.isArray)
+                throw std::runtime_error("smt2 parser: arrays of arrays not supported");
+            S2Sort s;
+            s.isBool = false; s.width = -1; s.isArray = true;
+            s.idxWidth = idxS.width;
+            s.elemIsBool = elemS.isBool;
+            s.elemWidth = elemS.isBool ? 1 : elemS.width;
+            return s;
         } else {
             st.skipBalanced();
             return {true, -1};
@@ -182,6 +202,12 @@ struct S2Ctx {
     int trueNode = -1, falseNode = -1;
     int mkVar(const std::string &name, bool isBool, int width) {
         Node n; n.op = "var"; n.name = name; n.isBool = isBool; n.width = isBool ? -1 : width;
+        ir.nodes.push_back(n);
+        return (int)ir.nodes.size() - 1;
+    }
+    int mkArrayVar(const std::string &name, int idxWidth, bool elemIsBool, int elemWidth) {
+        Node n; n.op = "var"; n.name = name; n.isBool = false; n.width = -1;
+        n.isArray = true; n.idxWidth = idxWidth; n.elemIsBool = elemIsBool; n.elemWidth = elemWidth;
         ir.nodes.push_back(n);
         return (int)ir.nodes.size() - 1;
     }
@@ -219,11 +245,23 @@ static const std::unordered_set<std::string> S2_ARG0_OPS = {
     "bvshl", "bvlshr", "bvashr",
     "bvneg", "bvnot",
     "+", "-", "*", "div", "mod", "abs", "rem",
-    "select",
 };
 
 static S2Sort smt2InferSort(S2Ctx &ctx, const std::string &op, const std::vector<long long> &params,
                              const std::vector<int> &args) {
+    if (op == "select") {
+        // args = [array, index]; result is the array's element sort.
+        const Node &arrN = ctx.ir.nodes[args[0]];
+        S2Sort s; s.isBool = arrN.elemIsBool; s.width = arrN.elemWidth;
+        return s;
+    }
+    if (op == "store") {
+        // args = [array, index, value]; result is the same array sort.
+        const Node &arrN = ctx.ir.nodes[args[0]];
+        S2Sort s; s.isBool = false; s.width = -1; s.isArray = true;
+        s.idxWidth = arrN.idxWidth; s.elemIsBool = arrN.elemIsBool; s.elemWidth = arrN.elemWidth;
+        return s;
+    }
     if (S2_BOOL_OPS.count(op)) return {true, -1};
     if (op == "bvcomp") return {false, 1};
     if (op == "concat") {
@@ -246,7 +284,15 @@ static S2Sort smt2InferSort(S2Ctx &ctx, const std::string &op, const std::vector
         return {ctx.ir.nodes[args[0]].isBool, ctx.ir.nodes[args[0]].width};
     }
     if (op == "ite") {
-        if (args.size() > 1) return {ctx.ir.nodes[args[1]].isBool, ctx.ir.nodes[args[1]].width};
+        if (args.size() > 1) {
+            const Node &tn = ctx.ir.nodes[args[1]];
+            if (tn.isArray) {
+                S2Sort s; s.isBool = false; s.width = -1; s.isArray = true;
+                s.idxWidth = tn.idxWidth; s.elemIsBool = tn.elemIsBool; s.elemWidth = tn.elemWidth;
+                return s;
+            }
+            return {tn.isBool, tn.width};
+        }
         return {true, -1};
     }
     if (S2_ARG0_OPS.count(op) && !args.empty())
@@ -267,141 +313,194 @@ static std::vector<int> smt2ParseArgList(S2Stream &st, S2Env &env, S2Ctx &ctx) {
     return args;
 }
 
+// Parses one term. `let`-chains are flattened iteratively: a real
+// ESBMC-merged dump nests lets hundreds of thousands deep in a single
+// assert (each subexpression gets its own let, chained:
+// (let ((?x0 ..)) (let ((?x1 ..)) .. body))), and array-heavy formulas are
+// exactly the kind that produce this. Recursing into the body once per let
+// -- as this function used to -- makes the C++ call stack track let-nesting
+// depth directly, which can blow the stack (a real crash here, not a
+// catchable exception -- mirrors the segfault fixed in ns_parser.py's
+// _parse_term, commit b6f56fa). The `for(;;)` loop below enters each
+// nested let's scope and loops back to parse the body in place, instead of
+// calling itself; letDepth counts how many scopes/close-parens are still
+// owed once the eventual non-let body is parsed, unwound once at each exit
+// point via `finish`. Only genuine sub-expression recursion remains
+// (parsing a let's own bound value, ite's arms, operator arguments etc.) --
+// that tracks ordinary expression depth, not let-nesting depth.
 static int smt2ParseTerm(S2Stream &st, S2Env &env, S2Ctx &ctx) {
-    const S2Token &t = st.peek();
+    int letDepth = 0;
+    auto finish = [&](int r) -> int {
+        while (letDepth--) { env.scopes.pop_back(); st.expectRP(); }
+        return r;
+    };
 
-    if (t.kind == S2Token::BVLIT) {
-        st.pop();
-        return ctx.mkBVLit(t.val, t.width);
-    }
+    for (;;) {
+        const S2Token &t = st.peek();
 
-    if (t.kind == S2Token::SYM) {
-        // attribute keyword or string literal placeholder
-        if (!t.text.empty() && (t.text[0] == ':' || t.text == "\"str\"")) {
+        if (t.kind == S2Token::BVLIT) {
             st.pop();
-            return ctx.mkTrue();
+            return finish(ctx.mkBVLit(t.val, t.width));
         }
-        st.pop();
-        if (t.text == "true") return ctx.mkTrue();
-        if (t.text == "false") return ctx.mkFalse();
-        // reject bare numerals -- this parser is QF_BV/QF_ABV only, same as
-        // dump_ir.py which raises on IntLit
-        {
-            bool allDigits = !t.text.empty();
-            size_t k = (t.text[0] == '-') ? 1 : 0;
-            if (k >= t.text.size()) allDigits = false;
-            for (size_t x = k; x < t.text.size() && allDigits; x++)
-                if (!isdigit((unsigned char)t.text[x])) allDigits = false;
-            if (allDigits)
-                throw std::runtime_error("smt2 parser: bare integer literal '" + t.text +
-                                          "' not supported (QF_BV/QF_ABV only)");
+
+        if (t.kind == S2Token::SYM) {
+            // attribute keyword or string literal placeholder
+            if (!t.text.empty() && (t.text[0] == ':' || t.text == "\"str\"")) {
+                st.pop();
+                return finish(ctx.mkTrue());
+            }
+            st.pop();
+            if (t.text == "true") return finish(ctx.mkTrue());
+            if (t.text == "false") return finish(ctx.mkFalse());
+            // reject bare numerals -- this parser is QF_BV/QF_ABV only, same as
+            // dump_ir.py which raises on IntLit
+            {
+                bool allDigits = !t.text.empty();
+                size_t k = (t.text[0] == '-') ? 1 : 0;
+                if (k >= t.text.size()) allDigits = false;
+                for (size_t x = k; x < t.text.size() && allDigits; x++)
+                    if (!isdigit((unsigned char)t.text[x])) allDigits = false;
+                if (allDigits)
+                    throw std::runtime_error("smt2 parser: bare integer literal '" + t.text +
+                                              "' not supported (QF_BV/QF_ABV only)");
+            }
+            int nid = env.lookup(t.text);
+            if (nid >= 0) return finish(nid);
+            // unbound symbol -- treat as an opaque bool var, matching
+            // ns_parser.py's fallback (Var(t, BOOL)); should not occur in
+            // well-formed ESBMC output.
+            return finish(ctx.mkVar(t.text, true, -1));
         }
-        int nid = env.lookup(t.text);
-        if (nid >= 0) return nid;
-        // unbound symbol -- treat as an opaque bool var, matching
-        // ns_parser.py's fallback (Var(t, BOOL)); should not occur in
-        // well-formed ESBMC output.
-        return ctx.mkVar(t.text, true, -1);
-    }
 
-    // compound term
-    st.expectLP();
-    if (st.peek().kind == S2Token::RP) { st.pop(); return ctx.mkTrue(); }
-
-    // let
-    if (st.peek().kind == S2Token::SYM && st.peek().text == "let") {
-        st.pop();
+        // compound term
         st.expectLP();
-        std::vector<std::pair<std::string, int>> bindings;
-        while (st.peek().kind != S2Token::RP) {
+        if (st.peek().kind == S2Token::RP) { st.pop(); return finish(ctx.mkTrue()); }
+
+        // let: enter the new scope and loop back to parse the body in
+        // place instead of recursing (see function comment above).
+        if (st.peek().kind == S2Token::SYM && st.peek().text == "let") {
+            st.pop();
             st.expectLP();
-            std::string name = st.pop().text;
-            int val = smt2ParseTerm(st, env, ctx); // sees OUTER scope only
+            std::vector<std::pair<std::string, int>> bindings;
+            while (st.peek().kind != S2Token::RP) {
+                st.expectLP();
+                std::string name = st.pop().text;
+                int val = smt2ParseTerm(st, env, ctx); // sees OUTER scope only
+                st.expectRP();
+                bindings.emplace_back(name, val);
+            }
             st.expectRP();
-            bindings.emplace_back(name, val);
+            env.scopes.emplace_back();
+            for (auto &b : bindings) env.scopes.back()[b.first] = b.second;
+            letDepth++;
+            continue; // parse body next iteration, no recursive call
         }
-        st.expectRP();
-        env.scopes.emplace_back();
-        for (auto &b : bindings) env.scopes.back()[b.first] = b.second;
-        int body = smt2ParseTerm(st, env, ctx);
-        env.scopes.pop_back();
-        st.expectRP();
-        return body;
-    }
 
-    // forall/exists -- not expected in QF_*, skip the binder list, parse body
-    if (st.peek().kind == S2Token::SYM && (st.peek().text == "forall" || st.peek().text == "exists")) {
-        st.pop();
-        st.expectLP();
-        st.skipBalanced();
-        int body = smt2ParseTerm(st, env, ctx);
-        st.expectRP();
-        return body;
-    }
+        // forall/exists -- not expected in QF_*, skip the binder list, parse body
+        if (st.peek().kind == S2Token::SYM && (st.peek().text == "forall" || st.peek().text == "exists")) {
+            st.pop();
+            st.expectLP();
+            st.skipBalanced();
+            int body = smt2ParseTerm(st, env, ctx);
+            st.expectRP();
+            return finish(body);
+        }
 
-    // ite
-    if (st.peek().kind == S2Token::SYM && st.peek().text == "ite") {
-        st.pop();
-        int c = smt2ParseTerm(st, env, ctx);
-        int th = smt2ParseTerm(st, env, ctx);
-        int el = smt2ParseTerm(st, env, ctx);
-        st.expectRP();
-        std::vector<int> args = {c, th, el};
-        S2Sort sort = smt2InferSort(ctx, "ite", {}, args);
-        Node n; n.op = "ite"; n.args = args; n.isBool = sort.isBool; n.width = sort.width;
-        ctx.ir.nodes.push_back(n);
-        return (int)ctx.ir.nodes.size() - 1;
-    }
-
-    // as-const / other unsupported "as" forms
-    if (st.peek().kind == S2Token::SYM && st.peek().text == "as") {
-        throw std::runtime_error("smt2 parser: 'as' (array-const) forms not supported");
-    }
-
-    // indexed op used as the head: ((_ op p...) args...) or (_ bvN W) / (_ BitVec N)
-    if (st.peek().kind == S2Token::LP) {
-        size_t saved = st.i;
-        st.pop(); // inner '('
-        if (st.peek().kind == S2Token::SYM && st.peek().text == "_") {
-            st.pop(); // '_'
-            std::string op = st.pop().text;
-            std::vector<long long> params;
-            while (st.peek().kind != S2Token::RP) params.push_back(std::stoll(st.pop().text));
-            st.expectRP(); // close inner '('
-            std::vector<int> args = smt2ParseArgList(st, env, ctx); // consumes outer RP
-            S2Sort sort = smt2InferSort(ctx, op, params, args);
-            Node n; n.op = op; n.args = args; n.params = params;
-            n.isBool = sort.isBool; n.width = sort.width;
+        // ite
+        if (st.peek().kind == S2Token::SYM && st.peek().text == "ite") {
+            st.pop();
+            int c = smt2ParseTerm(st, env, ctx);
+            int th = smt2ParseTerm(st, env, ctx);
+            int el = smt2ParseTerm(st, env, ctx);
+            st.expectRP();
+            std::vector<int> args = {c, th, el};
+            S2Sort sort = smt2InferSort(ctx, "ite", {}, args);
+            Node n; n.op = "ite"; n.args = args; n.isBool = sort.isBool; n.width = sort.width;
+            n.isArray = sort.isArray; n.idxWidth = sort.idxWidth;
+            n.elemIsBool = sort.elemIsBool; n.elemWidth = sort.elemWidth;
             ctx.ir.nodes.push_back(n);
-            return (int)ctx.ir.nodes.size() - 1;
+            return finish((int)ctx.ir.nodes.size() - 1);
         }
-        st.i = saved; // not an indexed op after all; unsupported (function term as head)
-        throw std::runtime_error("smt2 parser: nested non-indexed term as application head not supported");
-    }
 
-    // (_ bvN W) as a whole term, or other indexed constant
-    if (st.peek().kind == S2Token::SYM && st.peek().text == "_") {
-        st.pop();
-        std::string sym = st.pop().text;
-        if (sym.size() > 2 && sym[0] == 'b' && sym[1] == 'v') {
-            unsigned long long val = strtoull(sym.c_str() + 2, nullptr, 10);
-            int w = std::stoi(st.pop().text);
+        // ((as const (Array I E)) v) -- array-constant. The "(as const T)"
+        // part is the function symbol; it is applied to one value argument
+        // in an outer paren, so this is only reachable from the
+        // "indexed op used as the head"-shaped branch below, but we handle
+        // "as" directly here for the case it appears as the head itself.
+        if (st.peek().kind == S2Token::SYM && st.peek().text == "as") {
+            st.pop();
+            std::string asHead = st.pop().text;
+            S2Sort asSort = smt2ParseSort(st);
+            st.expectRP(); // close "(as const T)"
+            if (asHead != "const" || !asSort.isArray)
+                throw std::runtime_error("smt2 parser: unsupported 'as' form '" + asHead + "'");
+            throw std::runtime_error("smt2 parser: '(as const T)' used without a value argument");
+        }
+
+        // indexed op used as the head: ((_ op p...) args...), (_ bvN W) /
+        // (_ BitVec N), or ((as const (Array I E)) v)
+        if (st.peek().kind == S2Token::LP) {
+            size_t saved = st.i;
+            st.pop(); // inner '('
+            if (st.peek().kind == S2Token::SYM && st.peek().text == "_") {
+                st.pop(); // '_'
+                std::string op = st.pop().text;
+                std::vector<long long> params;
+                while (st.peek().kind != S2Token::RP) params.push_back(std::stoll(st.pop().text));
+                st.expectRP(); // close inner '('
+                std::vector<int> args = smt2ParseArgList(st, env, ctx); // consumes outer RP
+                S2Sort sort = smt2InferSort(ctx, op, params, args);
+                Node n; n.op = op; n.args = args; n.params = params;
+                n.isBool = sort.isBool; n.width = sort.width;
+                n.isArray = sort.isArray; n.idxWidth = sort.idxWidth;
+                n.elemIsBool = sort.elemIsBool; n.elemWidth = sort.elemWidth;
+                ctx.ir.nodes.push_back(n);
+                return finish((int)ctx.ir.nodes.size() - 1);
+            }
+            if (st.peek().kind == S2Token::SYM && st.peek().text == "as") {
+                st.pop(); // 'as'
+                std::string asHead = st.pop().text; // "const"
+                S2Sort asSort = smt2ParseSort(st);
+                st.expectRP(); // close inner "(as const T)"
+                if (asHead != "const" || !asSort.isArray)
+                    throw std::runtime_error("smt2 parser: unsupported 'as' form '" + asHead + "'");
+                std::vector<int> args = smt2ParseArgList(st, env, ctx); // consumes outer RP
+                Node n; n.op = "as_const"; n.args = {args[0]};
+                n.isBool = false; n.width = -1; n.isArray = true;
+                n.idxWidth = asSort.idxWidth; n.elemIsBool = asSort.elemIsBool; n.elemWidth = asSort.elemWidth;
+                ctx.ir.nodes.push_back(n);
+                return finish((int)ctx.ir.nodes.size() - 1);
+            }
+            st.i = saved; // not an indexed op after all; unsupported (function term as head)
+            throw std::runtime_error("smt2 parser: nested non-indexed term as application head not supported");
+        }
+
+        // (_ bvN W) as a whole term, or other indexed constant
+        if (st.peek().kind == S2Token::SYM && st.peek().text == "_") {
+            st.pop();
+            std::string sym = st.pop().text;
+            if (sym.size() > 2 && sym[0] == 'b' && sym[1] == 'v') {
+                unsigned long long val = strtoull(sym.c_str() + 2, nullptr, 10);
+                int w = std::stoi(st.pop().text);
+                st.expectRP();
+                return finish(ctx.mkBVLit(val, w));
+            }
+            // unknown indexed constant (e.g. FP +oo) -- skip, placeholder true
+            while (st.peek().kind != S2Token::RP) st.pop();
             st.expectRP();
-            return ctx.mkBVLit(val, w);
+            return finish(ctx.mkTrue());
         }
-        // unknown indexed constant (e.g. FP +oo) -- skip, placeholder true
-        while (st.peek().kind != S2Token::RP) st.pop();
-        st.expectRP();
-        return ctx.mkTrue();
-    }
 
-    // general operator application
-    std::string op = st.pop().text;
-    std::vector<int> args = smt2ParseArgList(st, env, ctx); // consumes RP
-    S2Sort sort = smt2InferSort(ctx, op, {}, args);
-    Node n; n.op = op; n.args = args; n.isBool = sort.isBool; n.width = sort.width;
-    ctx.ir.nodes.push_back(n);
-    return (int)ctx.ir.nodes.size() - 1;
+        // general operator application (includes select/store)
+        std::string op = st.pop().text;
+        std::vector<int> args = smt2ParseArgList(st, env, ctx); // consumes RP
+        S2Sort sort = smt2InferSort(ctx, op, {}, args);
+        Node n; n.op = op; n.args = args; n.isBool = sort.isBool; n.width = sort.width;
+        n.isArray = sort.isArray; n.idxWidth = sort.idxWidth;
+        n.elemIsBool = sort.elemIsBool; n.elemWidth = sort.elemWidth;
+        ctx.ir.nodes.push_back(n);
+        return finish((int)ctx.ir.nodes.size() - 1);
+    }
 }
 
 static IR parseSmt2File(const std::string &path) {
@@ -434,7 +533,8 @@ static IR parseSmt2File(const std::string &path) {
             S2Sort ret = smt2ParseSort(st);
             st.expectRP();
             if (paramSorts.empty()) {
-                int nid = ctx.mkVar(name, ret.isBool, ret.width);
+                int nid = ret.isArray ? ctx.mkArrayVar(name, ret.idxWidth, ret.elemIsBool, ret.elemWidth)
+                                       : ctx.mkVar(name, ret.isBool, ret.width);
                 env.scopes.front()[name] = nid;
                 declaredSorts[name] = ret;
             } // non-nullary function decls: not callable, skip (matches ns_parser.py)
@@ -443,7 +543,8 @@ static IR parseSmt2File(const std::string &path) {
             std::string name = st.pop().text;
             S2Sort ret = smt2ParseSort(st);
             st.expectRP();
-            int nid = ctx.mkVar(name, ret.isBool, ret.width);
+            int nid = ret.isArray ? ctx.mkArrayVar(name, ret.idxWidth, ret.elemIsBool, ret.elemWidth)
+                                   : ctx.mkVar(name, ret.isBool, ret.width);
             env.scopes.front()[name] = nid;
             declaredSorts[name] = ret;
         }
@@ -470,7 +571,10 @@ static IR parseSmt2File(const std::string &path) {
                 // (same limitation as ns_parser.py: only nullary define-fun
                 // becomes usable).
                 env.scopes.emplace_back();
-                for (auto &p : params) env.scopes.back()[p.first] = ctx.mkVar(p.first, p.second.isBool, p.second.width);
+                for (auto &p : params)
+                    env.scopes.back()[p.first] =
+                        p.second.isArray ? ctx.mkArrayVar(p.first, p.second.idxWidth, p.second.elemIsBool, p.second.elemWidth)
+                                          : ctx.mkVar(p.first, p.second.isBool, p.second.width);
                 smt2ParseTerm(st, env, ctx);
                 env.scopes.pop_back();
                 st.expectRP();
@@ -495,6 +599,7 @@ static IR parseSmt2File(const std::string &path) {
     }
 
     for (auto &kv : declaredSorts) {
+        if (kv.second.isArray) continue; // no scalar model value to report for an array
         Declare d;
         d.name = kv.first;
         d.isBool = kv.second.isBool;

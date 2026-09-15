@@ -14,9 +14,36 @@ project's development (SAT/UNSAT agreement, full model verification, and
 ~2x-2.5x faster end-to-end than the Python solver on real ESBMC-generated
 formulas.
 
+Array theory (`select`/`store`) is supported: `(Array (_ BitVec I) E)`
+sorts (E either `(_ BitVec N)` or `Bool`), `select`, `store`, array-typed
+`ite`, and `(as const (Array I E))`, via the same read-over-write encoding
+as the Python solver (`gansat/ns_bitblaster.py`'s `_blast_select`), with an
+iterative (non-recursive) store/ite-chain walk so a long store chain on one
+array cannot blow the C++ call stack. Validated: SAT/UNSAT and model
+agreement against the Python solver on six hand-built formulas (single
+store+select, multi-index stores, overwrite-same-index, array-typed `ite`,
+an opaque array with the weak-consistency axiom, and `as-const`); a
+synthetic deep-store-chain stress test at depths 10/100/1000/10000/100000
+with no crash, correct results (verified against the expected
+last-write-wins value), and roughly linear time scaling (10k: ~0.19s,
+100k: ~1.6s); and the real RERS `Prob13-REACH-DS-SEQ-B2` captured formula
+(31 MB, ~508k nested `let`s, 7380 array ops), which now parses and starts
+bit-blasting/solving instead of being rejected, but currently exhausts
+memory during solving on that formula even under a 40 GB cap -- a capacity
+limit of this specific large instance, not a crash or a correctness bug
+(the parser and bit-blaster themselves complete without error on formulas
+that fit in memory). The C++ parser's own `let`-chain handling was
+previously recursive (unlike the already-fixed Python parser) and has been
+converted to the same iterative loop, independent of the array work, since
+deep `let` nesting is exactly what array-heavy real formulas produce.
+
 Known limitations:
-- No array theory (`select`/`store`) support — untested, throws a clear
-  error rather than silently mishandling it.
+- Array theory: no extensional array equality (`(= arr1 arr2)` between two
+  whole arrays) -- throws a clear error rather than silently mishandling
+  it; not exercised end-to-end on a large real array-heavy formula within
+  practical memory limits (see above) -- treat it as validated on the
+  formula shapes and depths listed, not as proven for arbitrary
+  real-world array-heavy input.
 - No LIA (linear integer arithmetic) or DPLL support — QF_BV only.
 - No GAN-guided candidate generation — this is a pure symbolic solver,
   matching what the Python path does when the GAN doesn't fire (which is

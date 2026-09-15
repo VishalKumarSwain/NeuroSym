@@ -544,6 +544,14 @@ struct Node {
     int width = -1;             // -1 = bool
     bool isBool = false;
     std::string name;           // for var
+    // Array theory: isArray marks a node of Array sort (var/store/as_const/
+    // array-typed ite). idxWidth is the index BV width; elemIsBool/
+    // elemWidth describe the element sort the same way width/isBool would
+    // for a scalar node.
+    bool isArray = false;
+    int idxWidth = -1;
+    bool elemIsBool = false;
+    int elemWidth = -1;
 };
 
 struct IRResult {
@@ -551,10 +559,125 @@ struct IRResult {
     std::unordered_map<int, int> boolCache;
     // BV value cache (node id -> vector of literals, MSB-first)
     std::unordered_map<int, std::vector<int>> bvCache;
+    // Array theory: read-over-write encoding state, ported from
+    // gansat/ns_bitblaster.py's _Blaster._array_reads. Keyed by the array
+    // "root" variable's name (not node id) -- the parser can build several
+    // Node objects referring to "the same array" (e.g. two `select`s on a
+    // var of the same name), so name is the right identity, matching the
+    // Python reference's own reasoning. Value: every (index_bits,
+    // result_bits) pair resolved against that array so far, used to add
+    // the weak array consistency axiom (idx_i == idx_j -> value_i == value_j)
+    // against each new select.
+    std::unordered_map<std::string, std::vector<std::pair<std::vector<int>, std::vector<int>>>> arrayReads;
 };
 
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid);
 int blastBool(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid);
+
+// select(arrNode, idxNode), returning elemWidth-shaped bits (elemIsBool ->
+// a single bit, treated the same as a 1-bit BV throughout).
+//
+// No dedicated array decision procedure: store/as_const/ite chains are
+// peeled by direct term rewriting (read-over-write) rather than
+// bit-blasted as arrays in their own right, so a store never itself needs
+// an array representation -- only the eventual select does. Bottoms out at
+// a genuine array variable (or any other opaque array-valued node), where
+// consistency with every previously resolved select against that same
+// array is enforced by the weak array axiom: idx_i == idx_j -> value_i ==
+// value_j. Ported from gansat/ns_bitblaster.py's _blast_select (see that
+// function's own comment for the full reasoning).
+//
+// Implementation note: every step along a store/ite chain carries the
+// *same* idxBits -- only the array node changes as we walk down the chain
+// -- so the whole chain is really a tree walk over arrNode alone. That walk
+// is done here with an explicit worklist/stack instead of C++-level
+// recursion: on real array-heavy formulas a single array can accumulate
+// thousands of nested stores (and the store chain itself was already built
+// by an iterative let-chain parse for exactly this reason -- see
+// smt2ParseTerm), so recursing into it here would just reintroduce the
+// same class of stack-depth-proportional-to-chain-length crash the parser
+// fix avoided. An iterative walk has no depth ceiling tied to chain length.
+std::vector<int> blastSelect(Blaster &bl, std::vector<Node> &nodes, IRResult &res,
+                              int arrNode, int idxNode, bool elemIsBool, int elemWidth) {
+    int width = elemIsBool ? 1 : elemWidth;
+    std::vector<int> idxBits = blastBV(bl, nodes, res, idxNode);
+
+    std::unordered_map<int, std::vector<int>> results;
+    std::vector<std::pair<int, bool>> stack;
+    stack.push_back({arrNode, false});
+
+    while (!stack.empty()) {
+        int nodeId = stack.back().first;
+        bool expanded = stack.back().second;
+        stack.pop_back();
+        if (results.count(nodeId)) continue;
+        Node &node = nodes[nodeId];
+
+        if (node.op == "store") {
+            int a0 = node.args[0], i0 = node.args[1], v0 = node.args[2];
+            if (!expanded) {
+                stack.push_back({nodeId, true});
+                stack.push_back({a0, false});
+                continue;
+            }
+            std::vector<int> elseBits = results[a0];
+            std::vector<int> i0Bits = blastBV(bl, nodes, res, i0);
+            int eq = bl.bv_eq(idxBits, i0Bits);
+            std::vector<int> thenBits = elemIsBool
+                ? std::vector<int>{blastBool(bl, nodes, res, v0)}
+                : blastBV(bl, nodes, res, v0);
+            std::vector<int> rb(width);
+            for (int k = 0; k < width; k++) rb[k] = bl.gate_ite(eq, thenBits[k], elseBits[k]);
+            results[nodeId] = rb;
+            continue;
+        }
+
+        if (node.op == "as_const") {
+            std::vector<int> v = elemIsBool
+                ? std::vector<int>{blastBool(bl, nodes, res, node.args[0])}
+                : blastBV(bl, nodes, res, node.args[0]);
+            results[nodeId] = v;
+            continue;
+        }
+
+        if (node.op == "ite") {
+            int tId = node.args[1], eId = node.args[2];
+            if (!expanded) {
+                stack.push_back({nodeId, true});
+                stack.push_back({eId, false});
+                stack.push_back({tId, false});
+                continue;
+            }
+            int cond = blastBool(bl, nodes, res, node.args[0]);
+            std::vector<int> tBits = results[tId], eBits = results[eId];
+            std::vector<int> rb(width);
+            for (int k = 0; k < width; k++) rb[k] = bl.gate_ite(cond, tBits[k], eBits[k]);
+            results[nodeId] = rb;
+            continue;
+        }
+
+        // Base case: an opaque array (a var, or any other node we don't
+        // peel further). Key by variable name, not node id -- the parser
+        // can build multiple Node objects referring to "the same array".
+        std::string arrKey = (node.op == "var") ? node.name : ("#anon" + std::to_string(nodeId));
+        std::vector<int> resultBits(width);
+        for (int k = 0; k < width; k++) resultBits[k] = bl.fresh();
+
+        auto &prior = res.arrayReads[arrKey];
+        for (auto &pr : prior) {
+            int idxEq = bl.bv_eq(idxBits, pr.first);
+            for (int k = 0; k < width; k++) {
+                int valEq = bl.gate_not(bl.gate_xor(resultBits[k], pr.second[k]));
+                bl.addClauseLits({-idxEq, valEq}); // idx_i==idx_j -> bit_k equal
+            }
+        }
+        prior.push_back({idxBits, resultBits});
+
+        results[nodeId] = resultBits;
+    }
+
+    return results[arrNode];
+}
 
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
     auto it = res.bvCache.find(nid);
@@ -651,6 +774,8 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
         std::vector<int> a = blastBV(bl, nodes, res, n.args[0]);
         long long times = n.params[0];
         for (long long t = 0; t < times; t++) out.insert(out.end(), a.begin(), a.end());
+    } else if (n.op == "select") {
+        out = blastSelect(bl, nodes, res, n.args[0], n.args[1], n.isBool, n.width);
     } else {
         throw std::runtime_error("unsupported BV op in IR: " + n.op);
     }
@@ -698,6 +823,8 @@ int blastBool(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
         out = bl.gate_ite(c, t, e);
     } else if (n.op == "=") {
         Node &a0 = nodes[n.args[0]];
+        if (a0.isArray)
+            throw std::runtime_error("smt2 parser: extensional array equality ('=' between two arrays) not supported");
         if (a0.isBool) {
             int a = blastBool(bl, nodes, res, n.args[0]);
             int b = blastBool(bl, nodes, res, n.args[1]);
@@ -742,6 +869,8 @@ int blastBool(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
         out = bl.bv_slt(blastBV(bl, nodes, res, n.args[1]), blastBV(bl, nodes, res, n.args[0]));
     } else if (n.op == "bvsge") {
         out = bl.bv_sle(blastBV(bl, nodes, res, n.args[1]), blastBV(bl, nodes, res, n.args[0]));
+    } else if (n.op == "select") {
+        out = blastSelect(bl, nodes, res, n.args[0], n.args[1], n.isBool, n.width)[0];
     } else {
         throw std::runtime_error("unsupported Bool op in IR: " + n.op);
     }
