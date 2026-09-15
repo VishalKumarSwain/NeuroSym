@@ -762,6 +762,36 @@ std::vector<int> blastSelect(Blaster &bl, std::vector<Node> &nodes, IRResult &re
     return results[arrNode];
 }
 
+// Push an extract down through concat/extract chains instead of always
+// blasting the full source node and slicing afterward -- when the
+// requested range [hi,lo] (0-indexed from LSB) falls entirely within one
+// operand of a concat, or through a nested extract, the OTHER operand
+// (or the outer extract's redundant bits) is never blasted at all, not
+// just discarded after the fact. Falls back to blast-then-slice for
+// anything else (a general expression, or a range spanning both concat
+// operands).
+static std::vector<int> extractBits(Blaster &bl, std::vector<Node> &nodes, IRResult &res,
+                                     int nid, long long hi, long long lo) {
+    Node &n = nodes[nid];
+    if (n.op == "extract") {
+        long long innerLo = n.params[1];
+        return extractBits(bl, nodes, res, n.args[0], hi + innerLo, lo + innerLo);
+    }
+    if (n.op == "concat") {
+        long long wB = nodes[n.args[1]].width; // second arg = LSB part
+        if (hi < wB) return extractBits(bl, nodes, res, n.args[1], hi, lo);
+        if (lo >= wB) return extractBits(bl, nodes, res, n.args[0], hi - wB, lo - wB);
+        // Spans both operands -- fall through to the general path below,
+        // this case is rare and not worth the extra concat-of-two-partial-
+        // extracts bookkeeping for a first version.
+    }
+    std::vector<int> a = blastBV(bl, nodes, res, nid);
+    int w = (int)a.size();
+    std::vector<int> out(hi - lo + 1);
+    for (long long i = lo; i <= hi; i++) out[hi - i] = a[w - 1 - i];
+    return out;
+}
+
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
     auto it = res.bvCache.find(nid);
     if (it != res.bvCache.end()) return it->second;
@@ -783,11 +813,25 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
     } else if (n.op == "bvlit") {
         out = bl.int_to_bits((uint64_t)n.value, n.width);
     } else if (n.op == "ite") {
-        int c = blastBool(bl, nodes, res, n.args[0]);
-        std::vector<int> t = blastBV(bl, nodes, res, n.args[1]);
-        std::vector<int> e = blastBV(bl, nodes, res, n.args[2]);
-        out.resize(t.size());
-        for (size_t i = 0; i < t.size(); i++) out[i] = bl.gate_ite(c, t[i], e[i]);
+        // Constant-condition / identical-branch folding: if the condition
+        // is a literal, or both branches are the exact same node (a real,
+        // if less common, real-formula pattern -- and one the SSA
+        // substitution pass can expose more of, by collapsing what used
+        // to be two different node ids into references to the same one),
+        // skip gate_ite entirely and return the live branch's bits
+        // directly. Any other condition falls through to the general
+        // per-bit gate_ite path unchanged.
+        if (nodes[n.args[0]].op == "boollit") {
+            out = blastBV(bl, nodes, res, nodes[n.args[0]].boolValue ? n.args[1] : n.args[2]);
+        } else if (n.args[1] == n.args[2]) {
+            out = blastBV(bl, nodes, res, n.args[1]);
+        } else {
+            int c = blastBool(bl, nodes, res, n.args[0]);
+            std::vector<int> t = blastBV(bl, nodes, res, n.args[1]);
+            std::vector<int> e = blastBV(bl, nodes, res, n.args[2]);
+            out.resize(t.size());
+            for (size_t i = 0; i < t.size(); i++) out[i] = bl.gate_ite(c, t[i], e[i]);
+        }
     } else if (n.op == "bvadd") {
         out = bl.bv_add(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
     } else if (n.op == "bvsub") {
@@ -856,12 +900,38 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
         out = bl.bv_neg(blastBV(bl, nodes, res, n.args[0]));
     } else if (n.op == "bvnot") {
         out = bl.bv_not(blastBV(bl, nodes, res, n.args[0]));
-    } else if (n.op == "bvand") {
-        out = bl.bv_and(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
-    } else if (n.op == "bvor") {
-        out = bl.bv_or(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
-    } else if (n.op == "bvxor") {
-        out = bl.bv_xor(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+    } else if (n.op == "bvand" || n.op == "bvor" || n.op == "bvxor") {
+        // Trivial constant-operand identities, same pattern/rigor as the
+        // bvmul/bvudiv/bvurem strength reductions: x&0=0, x&ones=x,
+        // x|0=x, x|ones=ones, x^0=x. Skips gate construction entirely
+        // for the folded operand (not just a post-hoc simplification --
+        // the non-constant side is still blasted, since its bits may be
+        // needed elsewhere in the formula/model, but no AND/OR/XOR gates
+        // are built for this node). Any non-constant-operand case falls
+        // through unchanged to the general per-bit gate path.
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        bool handled = false;
+        for (int side = 0; side < 2 && !handled; side++) {
+            Node &constNode = nodes[n.args[side]];
+            int otherArg = n.args[1 - side];
+            if (constNode.op != "bvlit") continue;
+            uint64_t cv = (uint64_t)constNode.value & mask;
+            if (n.op == "bvand") {
+                if (cv == 0) { out = bl.int_to_bits(0, w); handled = true; }
+                else if (cv == mask) { out = blastBV(bl, nodes, res, otherArg); handled = true; }
+            } else if (n.op == "bvor") {
+                if (cv == 0) { out = blastBV(bl, nodes, res, otherArg); handled = true; }
+                else if (cv == mask) { out = bl.int_to_bits(mask, w); handled = true; }
+            } else { // bvxor
+                if (cv == 0) { out = blastBV(bl, nodes, res, otherArg); handled = true; }
+            }
+        }
+        if (!handled) {
+            std::vector<int> a = blastBV(bl, nodes, res, n.args[0]);
+            std::vector<int> b = blastBV(bl, nodes, res, n.args[1]);
+            out = (n.op == "bvand") ? bl.bv_and(a, b) : (n.op == "bvor") ? bl.bv_or(a, b) : bl.bv_xor(a, b);
+        }
     } else if (n.op == "bvnand") {
         out = bl.bv_not(bl.bv_and(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1])));
     } else if (n.op == "bvnor") {
@@ -880,14 +950,11 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
         out = a;
         out.insert(out.end(), b.begin(), b.end());
     } else if (n.op == "extract") {
-        // params = [hi, lo], operating on bit positions counted from LSB=0
-        std::vector<int> a = blastBV(bl, nodes, res, n.args[0]);
-        int w = (int)a.size();
-        long long hi = n.params[0], lo = n.params[1];
-        // a is MSB-first; index from MSB-first: LSB index i (0-based from
-        // right) corresponds to a[w-1-i]
-        out.resize(hi - lo + 1);
-        for (long long i = lo; i <= hi; i++) out[hi - i] = a[w - 1 - i];
+        // params = [hi, lo], operating on bit positions counted from LSB=0.
+        // Delegates to extractBits(), which pushes the extract down through
+        // concat/extract chains to avoid blasting bits that would just be
+        // discarded -- see that function's own comment.
+        out = extractBits(bl, nodes, res, n.args[0], n.params[0], n.params[1]);
     } else if (n.op == "zero_extend") {
         std::vector<int> a = blastBV(bl, nodes, res, n.args[0]);
         long long extra = n.params[0];
@@ -968,10 +1035,18 @@ int blastBool(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
         }
         out = acc;
     } else if (n.op == "ite") {
-        int c = blastBool(bl, nodes, res, n.args[0]);
-        int t = blastBool(bl, nodes, res, n.args[1]);
-        int e = blastBool(bl, nodes, res, n.args[2]);
-        out = bl.gate_ite(c, t, e);
+        // Same constant-condition/identical-branch folding as the BV ite
+        // handler above -- see that comment for the reasoning.
+        if (nodes[n.args[0]].op == "boollit") {
+            out = blastBool(bl, nodes, res, nodes[n.args[0]].boolValue ? n.args[1] : n.args[2]);
+        } else if (n.args[1] == n.args[2]) {
+            out = blastBool(bl, nodes, res, n.args[1]);
+        } else {
+            int c = blastBool(bl, nodes, res, n.args[0]);
+            int t = blastBool(bl, nodes, res, n.args[1]);
+            int e = blastBool(bl, nodes, res, n.args[2]);
+            out = bl.gate_ite(c, t, e);
+        }
     } else if (n.op == "=") {
         Node &a0 = nodes[n.args[0]];
         if (a0.isArray) {
