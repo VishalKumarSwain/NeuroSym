@@ -168,6 +168,17 @@ struct Blaster {
     std::map<std::pair<int,int>, int> xorCache;
     long xorCacheHits = 0, xorCacheMisses = 0;
     long xorVarsAvoided = 0, xorClausesAvoided = 0;
+    // AND-gate cache -- keyed by (min(a,b), max(a,b)), mirroring the XOR
+    // cache above. Measured on a real large ESBMC-generated pointer-
+    // aliasing formula (captured_dirname.smt2, ~7M SAT vars) where AND
+    // gates showed ~21% global SAT-literal-level duplication (650386 of
+    // 3088831 calls) -- unlike smaller test formulas earlier this session
+    // where AND/OR showed ~0% duplication and were correctly left uncached.
+    // OR/ITE/eq were also measured on this same formula and stayed
+    // negligible (<1%), so only AND gets a cache here.
+    std::map<std::pair<int,int>, int> andCache;
+    long andCacheHits = 0, andCacheMisses = 0;
+    long andVarsAvoided = 0, andClausesAvoided = 0;
 
     Blaster(SimpSolver &s) : S(s) {}
 
@@ -205,10 +216,20 @@ struct Blaster {
     int gate_not(int a) { return -a; }
 
     int gate_and(int a, int b) {
+        std::pair<int,int> key = (a <= b) ? std::make_pair(a, b) : std::make_pair(b, a);
+        auto it = andCache.find(key);
+        if (it != andCache.end()) {
+            andCacheHits++;
+            andVarsAvoided++;
+            andClausesAvoided += 3;
+            return it->second;
+        }
+        andCacheMisses++;
         int y = fresh();
         addClauseLits({-y, a});
         addClauseLits({-y, b});
         addClauseLits({y, -a, -b});
+        andCache[key] = y;
         return y;
     }
     int gate_or(int a, int b) {
@@ -1028,8 +1049,9 @@ static int run_solver(int argc, char **argv) {
         double solveMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
         fprintf(stderr, "TIMING load_blast_ms=%.3f solve_ms=%.3f total_ms=%.3f\n",
                 loadBlastMs, solveMs, loadBlastMs + solveMs);
-        fprintf(stderr, "STATS vars=%d xor_cache_hits=%ld xor_cache_misses=%ld xor_vars_avoided=%ld xor_clauses_avoided=%ld\n",
-                S.nVars(), bl.xorCacheHits, bl.xorCacheMisses, bl.xorVarsAvoided, bl.xorClausesAvoided);
+        fprintf(stderr, "STATS vars=%d xor_cache_hits=%ld xor_cache_misses=%ld xor_vars_avoided=%ld xor_clauses_avoided=%ld and_cache_hits=%ld and_cache_misses=%ld and_vars_avoided=%ld and_clauses_avoided=%ld\n",
+                S.nVars(), bl.xorCacheHits, bl.xorCacheMisses, bl.xorVarsAvoided, bl.xorClausesAvoided,
+                bl.andCacheHits, bl.andCacheMisses, bl.andVarsAvoided, bl.andClausesAvoided);
     }
 
     if (!sat) {
