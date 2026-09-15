@@ -823,8 +823,24 @@ int blastBool(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
         out = bl.gate_ite(c, t, e);
     } else if (n.op == "=") {
         Node &a0 = nodes[n.args[0]];
-        if (a0.isArray)
+        if (a0.isArray) {
+            // Reflexive case: both operands are literally the same array
+            // node (same declared symbol or same let-bound alias resolved
+            // to the same node id) -- always true regardless of contents,
+            // no extensionality axiom needed. This is sound for any array
+            // (including the unbounded-index ESBMC-internal memory-model
+            // arrays where full extensional equality is not implementable
+            // via index enumeration -- see README "Known limitations").
+            // Genuine equality between two *distinct* array terms still
+            // requires real extensionality (forall-index) reasoning this
+            // bit-blaster does not implement, so it remains a clean error.
+            if (n.args[0] == n.args[1]) {
+                out = bl.CONST_TRUE();
+                res.boolCache[nid] = out;
+                return out;
+            }
             throw std::runtime_error("smt2 parser: extensional array equality ('=' between two arrays) not supported");
+        }
         if (a0.isBool) {
             int a = blastBool(bl, nodes, res, n.args[0]);
             int b = blastBool(bl, nodes, res, n.args[1]);
@@ -932,7 +948,15 @@ static bool hasSuffix(const std::string &s, const std::string &suf) {
     return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
-int main(int argc, char **argv) {
+// Renamed from main(): the real entry point below wraps this in a
+// try/catch so any unsupported-construct exception (e.g. extensional
+// array equality, an unhandled SMT-LIB2 op) exits cleanly with a
+// defined non-zero code and a message on stderr, instead of escaping
+// uncaught into std::terminate/abort (SIGABRT, possible core dump).
+// The wrapper script (neurosym-cpp-solve) already treats any non-zero
+// exit as "unknown" and reports it gracefully to ESBMC; this just
+// makes that path deterministic and avoids relying on signal handling.
+static int run_solver(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <ir.json|formula.smt2> [--time] [--smtlib|--json]\n", argv[0]);
         return 2;
@@ -1048,4 +1072,16 @@ int main(int argc, char **argv) {
         }
     }
     return 0;
+}
+
+int main(int argc, char **argv) {
+    try {
+        return run_solver(argc, argv);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "neurosym bitblast_solver: error: %s\n", e.what());
+        return 3;
+    } catch (...) {
+        fprintf(stderr, "neurosym bitblast_solver: unknown fatal error\n");
+        return 3;
+    }
 }

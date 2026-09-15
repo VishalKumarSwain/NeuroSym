@@ -38,12 +38,30 @@ converted to the same iterative loop, independent of the array work, since
 deep `let` nesting is exactly what array-heavy real formulas produce.
 
 Known limitations:
-- Array theory: no extensional array equality (`(= arr1 arr2)` between two
-  whole arrays) -- throws a clear error rather than silently mishandling
-  it; not exercised end-to-end on a large real array-heavy formula within
-  practical memory limits (see above) -- treat it as validated on the
-  formula shapes and depths listed, not as proven for arbitrary
-  real-world array-heavy input.
+- Array theory: extensional array equality (`(= arr1 arr2)` between two
+  distinct array terms) is still not supported -- throws a clear error
+  rather than silently mishandling it. The one case that *is* handled:
+  reflexive equality, where both sides are literally the same array node
+  (e.g. the same declared symbol or `let`-alias used twice, as ESBMC own
+  encoding frequently emits) is recognized and resolved to `true` directly,
+  with no axiom needed. Real equality between two distinct array terms
+  still requires a genuine extensionality (forall-index) axiom this
+  bit-blaster does not implement, and bounded index enumeration is not a
+  viable substitute here: on real ESBMC-generated formulas (a 500-program
+  regression benchmark against ESBMC own C test suite), essentially every
+  extensional-equality case is between ESBMC internal unbounded
+  memory-model arrays (`(Array (_ BitVec 64) ...)`, e.g.
+  `__ESBMC_pthread_thread_ended`, `inf_array0/1`), so enumerating the index
+  domain is not feasible (2^64 values). Implementing this properly (a real
+  extensionality/Ackermannization lemma scheme) is a distinct, larger piece
+  of work than this pass scope.
+- Any unsupported construct this solver parser/bit-blaster hits (the above
+  included) is reported by throwing a C++ exception that `main()` now
+  catches at the top level, printing the message to stderr and exiting
+  with a defined code (3) -- deterministic and clean, rather than an
+  uncaught exception escaping to `std::terminate`/`abort()` (which risked
+  an uncontrolled SIGABRT/core dump depending on platform/libc). This does
+  not change *what* is supported, only how unsupported input fails.
 - No LIA (linear integer arithmetic) or DPLL support — QF_BV only.
 - No GAN-guided candidate generation — this is a pure symbolic solver,
   matching what the Python path does when the GAN doesn't fire (which is
