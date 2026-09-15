@@ -350,14 +350,52 @@ struct Blaster {
         std::vector<int> result = int_to_bits(0, w);
         for (int i = w - 1; i >= 0; i--) {
             int shift = w - 1 - i;
+            // Partial product for bit i of b (weight 2^shift) is a<<shift,
+            // i.e. new position k takes old position k+shift (zero-filled
+            // once k+shift runs off the LSB end at k >= w-shift) -- see
+            // bv_shl_const just below, which this mirrors exactly. NOTE:
+            // this was previously computed as a[k-shift] (0-filled at the
+            // MSB end instead), which is a right shift, not a left shift --
+            // a pre-existing correctness bug in the general (non-constant)
+            // multiply path, found and fixed here via the differential
+            // tests added for the mul/div strength-reduction work.
             std::vector<int> shifted(w);
-            for (int k = 0; k < shift; k++) shifted[k] = CONST_FALSE();
-            for (int k = shift; k < w; k++) shifted[k] = a[k - shift];
+            for (int k = 0; k < w - shift; k++) shifted[k] = a[k + shift];
+            for (int k = w - shift; k < w; k++) shifted[k] = CONST_FALSE();
             std::vector<int> masked(w);
             for (int j = 0; j < w; j++) masked[j] = gate_and(shifted[j], b[i]);
             result = bv_add(result, masked);
         }
         return result;
+    }
+
+    // ── constant-shift-amount rewiring, used by the bvmul/bvudiv/bvurem
+    // power-of-2 strength reductions below. Unlike bv_shl/bv_lshr (which
+    // encode a *variable* shift amount via a gate_ite chain over the bits
+    // of b), the shift amount here is a compile-time int, so this is pure
+    // literal rewiring -- zero new gates/clauses/variables.
+    std::vector<int> bv_shl_const(const std::vector<int> &a, int k) {
+        int w = (int)a.size();
+        std::vector<int> r(w);
+        for (int i = 0; i < w; i++) {
+            int srcIdx = i + k; // MSB-first: new bit i comes from old bit i+k
+            r[i] = (srcIdx < w) ? a[srcIdx] : CONST_FALSE();
+        }
+        return r;
+    }
+    std::vector<int> bv_lshr_const(const std::vector<int> &a, int k) {
+        int w = (int)a.size();
+        std::vector<int> r(w);
+        for (int i = 0; i < w; i++) r[i] = (i >= k) ? a[i - k] : CONST_FALSE();
+        return r;
+    }
+    // Keep only the low k bits of a (MSB-first array -> low bits are the
+    // last k entries), zero-filling the rest. Equivalent to a & (2^k - 1).
+    std::vector<int> bv_urem_pow2_const(const std::vector<int> &a, int k) {
+        int w = (int)a.size();
+        std::vector<int> r(w);
+        for (int i = 0; i < w; i++) r[i] = (i >= w - k) ? a[i] : CONST_FALSE();
+        return r;
     }
 
     int bv_eq(const std::vector<int> &a, const std::vector<int> &b) {
@@ -554,6 +592,15 @@ struct Blaster {
     }
 };
 
+// Detect a concrete power-of-2 unsigned value (used for mul/udiv/urem
+// strength reduction). 0 is not a power of 2. On success k is its log2.
+static bool isPow2Const(unsigned long long v, int &k) {
+    if (v == 0 || (v & (v - 1)) != 0) return false;
+    k = 0;
+    while (v > 1) { v >>= 1; k++; }
+    return true;
+}
+
 // ─────────────────────────────── IR evaluation ──────────────────────────────
 
 struct Node {
@@ -722,11 +769,61 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
     } else if (n.op == "bvsub") {
         out = bl.bv_sub(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
     } else if (n.op == "bvmul") {
-        out = bl.bv_mul(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        // Strength-reduce x*0 / x*1 / x*2^k (either operand order) before
+        // falling back to the general schoolbook multiplier. Each case is
+        // an exact rewrite, not an approximation; anything that isn't a
+        // concrete bvlit constant on at least one side takes the general
+        // bv_mul path unchanged.
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        bool handled = false;
+        for (int side = 0; side < 2 && !handled; side++) {
+            Node &constNode = nodes[n.args[side]];
+            int otherArg = n.args[1 - side];
+            if (constNode.op != "bvlit") continue;
+            uint64_t cv = (uint64_t)constNode.value & mask;
+            if (cv == 0) {
+                out = bl.int_to_bits(0, w);
+                handled = true;
+            } else if (cv == 1) {
+                out = blastBV(bl, nodes, res, otherArg);
+                handled = true;
+            } else {
+                int k;
+                if (isPow2Const(cv, k)) {
+                    out = bl.bv_shl_const(blastBV(bl, nodes, res, otherArg), k);
+                    handled = true;
+                }
+            }
+        }
+        if (!handled) {
+            out = bl.bv_mul(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        }
     } else if (n.op == "bvudiv") {
-        out = bl.bv_bvudiv(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        // x udiv 2^k = x >> k, unsigned only. b here is a concrete nonzero
+        // constant (power of 2), so the divide-by-zero case of bv_bvudiv
+        // can never apply and is safely skipped.
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        Node &rhs = nodes[n.args[1]];
+        int k;
+        if (rhs.op == "bvlit" && isPow2Const((uint64_t)rhs.value & mask, k)) {
+            out = bl.bv_lshr_const(blastBV(bl, nodes, res, n.args[0]), k);
+        } else {
+            out = bl.bv_bvudiv(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        }
     } else if (n.op == "bvurem") {
-        out = bl.bv_bvurem(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        // x urem 2^k = x & (2^k - 1), unsigned only; same zero-divisor
+        // reasoning as bvudiv above.
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        Node &rhs = nodes[n.args[1]];
+        int k;
+        if (rhs.op == "bvlit" && isPow2Const((uint64_t)rhs.value & mask, k)) {
+            out = bl.bv_urem_pow2_const(blastBV(bl, nodes, res, n.args[0]), k);
+        } else {
+            out = bl.bv_bvurem(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        }
     } else if (n.op == "bvsdiv") {
         out = bl.bv_bvsdiv(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
     } else if (n.op == "bvsrem") {
