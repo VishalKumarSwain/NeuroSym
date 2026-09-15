@@ -430,67 +430,30 @@ struct Blaster {
     }
     int bv_sle(const std::vector<int> &a, const std::vector<int> &b) { return gate_not(bv_slt(b, a)); }
 
-    // Relational (CBMC-style) encoding of unsigned division/remainder for
-    // the general (non-constant-power-of-2-divisor) case: instead of
-    // simulating a restoring-division circuit bit by bit (O(w) serially
-    // chained subtract/compare/select stages), introduce fresh free
-    // variables for the quotient and remainder and ASSERT the algebraic
-    // relationship among them and the operands as hard clauses:
-    //   b == 0  \/  q*b + r == a
-    //   b == 0  \/  r < b            (unsigned)
-    //   b == 0  \/  q <= a           (unsigned)
-    // The b==0 guard keeps these constraints from over-constraining the
-    // (otherwise free, but overridden by the caller's zero-divisor logic)
-    // q/r when the divisor is zero. See CBMC's
-    // src/solvers/flattening/bv_utils.cpp: unsigned_divider (called from
-    // boolbv_div.cpp) for the reference technique this mirrors.
     void bv_udivrem(const std::vector<int> &a, const std::vector<int> &b,
                      std::vector<int> &q_out, std::vector<int> &r_out) {
         int w = a.size();
-        std::vector<int> q(w), r(w);
-        for (int i = 0; i < w; i++) q[i] = fresh();
-        for (int i = 0; i < w; i++) r[i] = fresh();
-
-        // q*b and (q*b)+r must be computed WITHOUT wraparound, or spurious
-        // (q,r) pairs satisfying the truncated-mod-2^w relation but not the
-        // true integer relation become satisfiable (e.g. w=2, a=3, b=2: the
-        // true q=1,r=1, but q=3,r=1 also satisfies (q*b+r) mod 4 == a since
-        // 3*2+1=7 wraps to 3 mod 4). CBMC's unsigned_multiplier_no_overflow
-        // / adder_no_overflow avoid exactly this by widening before the
-        // operation and asserting the extra bits are zero -- mirrored here
-        // by zero-extending to 2w bits for the multiply (product of two
-        // w-bit values needs up to 2w bits) and to w+1 bits for the add
-        // (sum of two w-bit values needs up to w+1 bits), then asserting
-        // the high (overflow) bits are all zero as hard constraints.
-        std::vector<int> q_ext2w(2 * w), b_ext2w(2 * w);
-        for (int i = 0; i < w; i++) { q_ext2w[i] = CONST_FALSE(); b_ext2w[i] = CONST_FALSE(); }
-        for (int i = 0; i < w; i++) { q_ext2w[w + i] = q[i]; b_ext2w[w + i] = b[i]; }
-        std::vector<int> product_full = bv_mul(q_ext2w, b_ext2w); // 2w bits, MSB-first
-        std::vector<int> product_hi(product_full.begin(), product_full.begin() + w);
-        std::vector<int> product(product_full.begin() + w, product_full.end());
-        int mul_no_overflow = gate_not(gate_or_n(product_hi));
-
-        std::vector<int> product_extw1(w + 1), r_extw1(w + 1);
-        product_extw1[0] = CONST_FALSE();
-        r_extw1[0] = CONST_FALSE();
-        for (int i = 0; i < w; i++) { product_extw1[i + 1] = product[i]; r_extw1[i + 1] = r[i]; }
-        std::vector<int> sum_full = bv_add(product_extw1, r_extw1); // w+1 bits, MSB-first
-        int add_no_overflow = gate_not(sum_full[0]);
-        std::vector<int> sum(sum_full.begin() + 1, sum_full.end());
-
-        int eq = bv_eq(sum, a);
-        int rem_lt_div = bv_ult(r, b);
-        int quot_le_dividend = bv_ule(q, a);
-
-        int b_is_zero = gate_not(gate_or_n(b));
-        addClauseLits({b_is_zero, mul_no_overflow});
-        addClauseLits({b_is_zero, add_no_overflow});
-        addClauseLits({b_is_zero, eq});
-        addClauseLits({b_is_zero, rem_lt_div});
-        addClauseLits({b_is_zero, quot_le_dividend});
-
-        q_out = q;
-        r_out = r;
+        std::vector<int> r(w + 1);
+        for (int i = 0; i < w + 1; i++) r[i] = CONST_FALSE();
+        std::vector<int> b_ext(w + 1);
+        b_ext[0] = CONST_FALSE();
+        for (int i = 0; i < w; i++) b_ext[i + 1] = b[i];
+        std::vector<int> q_bits;
+        q_bits.reserve(w);
+        for (int i = 0; i < w; i++) {
+            std::vector<int> shifted(w + 1);
+            for (int k = 0; k < w; k++) shifted[k] = r[k + 1];
+            shifted[w] = a[i];
+            r = shifted;
+            int ge = gate_not(bv_ult(r, b_ext));
+            std::vector<int> r_sub = bv_sub(r, b_ext);
+            std::vector<int> r_new(w + 1);
+            for (int k = 0; k < w + 1; k++) r_new[k] = gate_ite(ge, r_sub[k], r[k]);
+            r = r_new;
+            q_bits.push_back(ge);
+        }
+        q_out = q_bits;
+        r_out = std::vector<int>(r.begin() + 1, r.end());
     }
 
     std::vector<int> bv_bvudiv(const std::vector<int> &a, const std::vector<int> &b) {
