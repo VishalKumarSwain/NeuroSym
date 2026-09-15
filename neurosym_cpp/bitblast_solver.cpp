@@ -384,6 +384,34 @@ struct Blaster {
         }
         return r;
     }
+    // General constant multiply via shift-add decomposition: for a known
+    // constant C with popcount p (p >= 2; p==1 is the pow2 case handled
+    // separately, and it's always a strict win over the general O(w^2)
+    // schoolbook bv_mul below -- p-1 additions of w-bit shifted copies of
+    // x, versus w additions each preceded by a per-bit AND gate against a
+    // symbolic multiplicand bit. bv_shl_const is free (pure rewiring), so
+    // this costs exactly (p-1) full bv_add calls, each O(w) gates/clauses,
+    // total O(p*w) versus bv_mul's O(w^2) -- for the small-popcount
+    // constants real ESBMC RERS output multiplies by (5, 10, 3, 9, ...:
+    // popcount 2 each), this replaces ~31 additions plus w^2 AND-gated
+    // partial products with a single addition and zero extra AND gates.
+    // Found directly from a real corpus OOM: bit-blasting ~900+ variable*
+    // small-constant multiplies with the general schoolbook multiplier
+    // produced a CNF large enough to exhaust an 8GB MiniSat clause
+    // database mid-search (Minisat::OutOfMemoryException) on 4 of 8 real
+    // RERS B4 benchmarks that otherwise solve in seconds.
+    std::vector<int> bv_mul_by_sparse_const(const std::vector<int> &x, uint64_t c, int w) {
+        std::vector<int> acc;
+        bool first = true;
+        for (int i = 0; i < w; i++) {
+            if (!((c >> i) & 1ULL)) continue;
+            std::vector<int> shifted = bv_shl_const(x, i);
+            if (first) { acc = shifted; first = false; }
+            else acc = bv_add(acc, shifted);
+        }
+        return acc; // caller guarantees c != 0, so acc is always assigned
+    }
+
     std::vector<int> bv_lshr_const(const std::vector<int> &a, int k) {
         int w = (int)a.size();
         std::vector<int> r(w);
@@ -952,6 +980,9 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
                 int k;
                 if (isPow2Const(cv, k)) {
                     out = bl.bv_shl_const(blastBV(bl, nodes, res, otherArg), k);
+                    handled = true;
+                } else {
+                    out = bl.bv_mul_by_sparse_const(blastBV(bl, nodes, res, otherArg), cv, w);
                     handled = true;
                 }
             }
@@ -1544,6 +1575,18 @@ int main(int argc, char **argv) {
         return run_solver(argc, argv);
     } catch (const std::exception &e) {
         fprintf(stderr, "neurosym bitblast_solver: error: %s\n", e.what());
+        return 3;
+    } catch (const Minisat::OutOfMemoryException &) {
+        // MiniSat's own allocator throws this directly (not derived from
+        // std::exception), so it would otherwise fall into the opaque
+        // catch(...) below with no diagnostic at all. Found via real RERS
+        // corpus testing: several B4 benchmarks bit-blast to a CNF large
+        // enough to exhaust an 8GB memory cap mid-search. This is a
+        // genuine resource-exhaustion outcome (not a bug to silently
+        // paper over), but it deserves a clear, specific message instead
+        // of "unknown fatal error" -- same clean-failure standard as the
+        // std::exception path just above.
+        fprintf(stderr, "neurosym bitblast_solver: out of memory (CNF too large for available memory)\n");
         return 3;
     } catch (...) {
         fprintf(stderr, "neurosym bitblast_solver: unknown fatal error\n");
