@@ -21,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace Minisat;
@@ -637,6 +638,20 @@ struct IRResult {
     // the weak array consistency axiom (idx_i == idx_j -> value_i == value_j)
     // against each new select.
     std::unordered_map<std::string, std::vector<std::pair<std::vector<int>, std::vector<int>>>> arrayReads;
+    // SSA variable substitution (var node id -> replacement expr node id).
+    // Built once up front from top-level "x = expr" assertions (occurs-
+    // checked and statically cycle-checked -- see buildSubstitutions()).
+    // Resolved lazily inside blastBV/blastBool: resolving x redirects to
+    // blasting the replacement, then the result is ALSO cached under x's
+    // OWN node id, so model output (which looks up declared variables by
+    // their node id) keeps working transparently for eliminated variables.
+    std::unordered_map<int, int> substMap;
+    // Defensive dynamic cycle guard, belt-and-suspenders alongside the
+    // static cycle check in buildSubstitutions(): if resolving a
+    // substitution ever re-enters a node id already being resolved, that's
+    // a bug in the static check, not a normal formula -- fail loudly
+    // instead of blowing the C++ stack.
+    std::unordered_set<int> substInProgress;
 };
 
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid);
@@ -750,6 +765,15 @@ std::vector<int> blastSelect(Blaster &bl, std::vector<Node> &nodes, IRResult &re
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
     auto it = res.bvCache.find(nid);
     if (it != res.bvCache.end()) return it->second;
+    auto sit = res.substMap.find(nid);
+    if (sit != res.substMap.end()) {
+        if (!res.substInProgress.insert(nid).second)
+            throw std::runtime_error("internal error: SSA substitution cycle at node " + std::to_string(nid));
+        std::vector<int> v = blastBV(bl, nodes, res, sit->second);
+        res.substInProgress.erase(nid);
+        res.bvCache[nid] = v;
+        return v;
+    }
     Node &n = nodes[nid];
     std::vector<int> out;
 
@@ -904,6 +928,15 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
 int blastBool(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid) {
     auto it = res.boolCache.find(nid);
     if (it != res.boolCache.end()) return it->second;
+    auto sit = res.substMap.find(nid);
+    if (sit != res.substMap.end()) {
+        if (!res.substInProgress.insert(nid).second)
+            throw std::runtime_error("internal error: SSA substitution cycle at node " + std::to_string(nid));
+        int v = blastBool(bl, nodes, res, sit->second);
+        res.substInProgress.erase(nid);
+        res.boolCache[nid] = v;
+        return v;
+    }
     Node &n = nodes[nid];
     int out;
 
@@ -1074,6 +1107,137 @@ static bool hasSuffix(const std::string &s, const std::string &suf) {
 // The wrapper script (neurosym-cpp-solve) already treats any non-zero
 // exit as "unknown" and reports it gracefully to ESBMC; this just
 // makes that path deterministic and avoids relying on signal handling.
+// ── SSA variable substitution (preprocessing, before bit-blasting) ─────────
+// Scans top-level assertions for the pattern "x = expr" / "expr = x" where
+// x is a bare declared-variable node -- the dominant shape of real
+// ESBMC-generated SSA output (sym!N = <expression>, repeated heavily).
+// Occurs-checked (x must not appear inside its own expr) and statically
+// cycle-checked across the whole substitution set before being trusted --
+// see buildSubstitutions(). Deliberately scoped to the direct
+// var-equals-expr case only, not linear forms like factor*x+rhs=c (that
+// generalization is a distinct, separate piece of work).
+//
+// Design: rather than physically rewriting the node graph (error-prone on
+// a node-id-referencing IR), substitution is applied LAZILY at blast time
+// via IRResult::substMap, checked at the top of blastBV/blastBool. This
+// has a direct, important side benefit: the resolved result is cached
+// under the ORIGINAL variable's node id too, so model-printing (which
+// looks up declared variables by node id) keeps reporting correct values
+// for eliminated variables with zero special-casing there.
+
+// Bounded DFS: on a huge formula (hundreds of thousands of nodes), an
+// unbounded per-candidate walk makes the whole pass O(assertions * nodes)
+// -- measured directly to hang for minutes on a real 900K+-variable
+// formula. Capping the number of DISTINCT nodes visited bounds each
+// check's cost; if the budget runs out before the walk completes, the
+// candidate is conservatively treated as "occurs" (or "might cycle",
+// same reasoning in substCycles below) and simply not substituted --
+// correctness never depends on the budget being large enough, only the
+// number of substitutions found does.
+static const int OCCURS_CHECK_BUDGET = 300;
+
+static bool nodeOccurs(std::vector<Node> &nodes, int target, int nid,
+                        std::unordered_set<int> &visited, int &budget) {
+    if (nid == target) return true;
+    if (budget-- <= 0) return true; // conservative: assume it occurs
+    if (!visited.insert(nid).second) return false;
+    Node &n = nodes[nid];
+    for (int a : n.args)
+        if (nodeOccurs(nodes, target, a, visited, budget)) return true;
+    return false;
+}
+
+// Static cycle check across the whole tentative substitution set: does
+// resolving varNid (transitively, through other substituted variables
+// reachable in its replacement expression) ever lead back to varNid?
+static bool substCycles(std::vector<Node> &nodes,
+                         std::unordered_map<int,int> &tentative,
+                         int varNid, int exprNid,
+                         std::unordered_set<int> &onStack,
+                         std::unordered_set<int> &visited, int &budget) {
+    if (budget-- <= 0) return true; // conservative: assume a cycle, drop this candidate
+    if (!onStack.insert(exprNid).second) {
+        bool cyc = (exprNid == varNid);
+        onStack.erase(exprNid);
+        return cyc;
+    }
+    if (exprNid == varNid) { onStack.erase(exprNid); return true; }
+    Node &n = nodes[exprNid];
+    bool found = false;
+    if (n.op == "var") {
+        auto it = tentative.find(exprNid);
+        if (it != tentative.end())
+            found = substCycles(nodes, tentative, varNid, it->second, onStack, visited, budget);
+    } else {
+        for (int a : n.args) {
+            if (substCycles(nodes, tentative, varNid, a, onStack, visited, budget)) { found = true; break; }
+        }
+    }
+    onStack.erase(exprNid);
+    return found;
+}
+
+static void buildSubstitutions(IR &ir, IRResult &res) {
+    std::unordered_map<int,int> tentative; // var node id -> replacement node id
+    std::vector<bool> eliminated(ir.assertions.size(), false);
+
+    for (size_t ai = 0; ai < ir.assertions.size(); ai++) {
+        int aid = ir.assertions[ai];
+        Node &an = ir.nodes[aid];
+        if (an.op != "=" || an.args.size() != 2) continue;
+        int lhs = an.args[0], rhs = an.args[1];
+        int varNid = -1, exprNid = -1;
+        if (ir.nodes[lhs].op == "var") { varNid = lhs; exprNid = rhs; }
+        else if (ir.nodes[rhs].op == "var") { varNid = rhs; exprNid = lhs; }
+        else continue;
+        if (varNid == exprNid) continue; // "x = x", not a real definition
+        if (tentative.count(varNid)) continue; // first definition wins, per spec
+
+        std::unordered_set<int> visited;
+        int budget = OCCURS_CHECK_BUDGET;
+        if (nodeOccurs(ir.nodes, varNid, exprNid, visited, budget)) continue; // occurs-check
+
+        tentative[varNid] = exprNid;
+        eliminated[ai] = true;
+    }
+
+    // Static, whole-set cycle check: verify no chain of tentative
+    // substitutions can lead back to its own starting variable. Any
+    // substitution found to participate in a cycle is dropped (its
+    // assertion reverts to being an ordinary, non-eliminated equality).
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto it = tentative.begin(); it != tentative.end(); ) {
+            std::unordered_set<int> onStack, visited;
+            int budget = OCCURS_CHECK_BUDGET;
+            if (substCycles(ir.nodes, tentative, it->first, it->second, onStack, visited, budget)) {
+                // Un-eliminate this one's assertion.
+                for (size_t ai = 0; ai < ir.assertions.size(); ai++) {
+                    Node &an = ir.nodes[ir.assertions[ai]];
+                    if (an.op == "=" && an.args.size() == 2 &&
+                        ((an.args[0] == it->first) || (an.args[1] == it->first)) &&
+                        eliminated[ai]) {
+                        eliminated[ai] = false;
+                        break;
+                    }
+                }
+                it = tentative.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    res.substMap = tentative;
+
+    std::vector<int> kept;
+    for (size_t ai = 0; ai < ir.assertions.size(); ai++)
+        if (!eliminated[ai]) kept.push_back(ir.assertions[ai]);
+    ir.assertions = kept;
+}
+
 static int run_solver(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <ir.json|formula.smt2> [--time] [--smtlib|--json]\n", argv[0]);
@@ -1102,6 +1266,21 @@ static int run_solver(int argc, char **argv) {
     SimpSolver S;
     Blaster bl(S);
     IRResult res;
+    buildSubstitutions(ir, res);
+    // Model printing looks declared variables up in bvCache/boolCache
+    // directly, without itself triggering a blast -- so an eliminated
+    // variable (substituted away, its defining equality dropped) must be
+    // force-blasted here, BEFORE solving, so it lands in the cache under
+    // its own node id via the substMap redirect in blastBV/blastBool.
+    // This adds no new constraints (blasting alone never asserts
+    // anything beyond the Tseitin definition clauses a bit's own gates
+    // always need), it only ensures the value is computed and cached for
+    // reporting.
+    for (auto &kv : res.substMap) {
+        int nid = kv.first;
+        if (ir.nodes[nid].isBool) blastBool(bl, ir.nodes, res, nid);
+        else blastBV(bl, ir.nodes, res, nid);
+    }
 
     // Pre-register var nodes with their variable ids by name so we can
     // report models afterward; and blast declares up front isn't required
