@@ -427,6 +427,56 @@ struct Blaster {
         return r;
     }
 
+    // Relational encoding of unsigned division/remainder by a KNOWN
+    // constant divisor c (c != 0, caller-guaranteed). Unlike the fully
+    // general symbolic-divisor relational encoding tried earlier this
+    // session (measured WORSE on real formulas and reverted -- see git
+    // history commit c83600c/38bcfa8 -- because it needed a full O(w^2)
+    // symbolic q*b multiplier), a known constant divisor lets q*c use the
+    // cheap O(popcount(c)*w) shift-add multiplier (bv_mul_by_sparse_const)
+    // in place of restoring division's O(w^2) shift-subtract-compare loop
+    // (bv_udivrem above). Introduces fresh q/r bits constrained only by
+    // c*q+r==a (computed at extended width so the multiply/add never
+    // wraps) and r<c -- since c is a fixed positive integer, these two
+    // constraints have a unique solution for any concrete a, so the SAT
+    // solver's model for q/r is exactly floor(a/c) and a mod c.
+    //
+    // This directly targets the confirmed root cause of the 4/8 RERS B4
+    // out-of-memory crashes found this session: ~1,330 bvsdiv/bvsrem-by-
+    // arbitrary-constant operations, each previously expanding into a
+    // full O(w^2) restoring-division circuit.
+    void bv_reldiv_by_const(const std::vector<int> &a, uint64_t c, int w,
+                             std::vector<int> &q_out, std::vector<int> &r_out) {
+        int k = 0;
+        while ((c >> k) != 0) k++;      // k = bit-length of c, so c < 2^k
+        int ew = w + k;                  // extended width: multiply+add never overflows
+
+        std::vector<int> q(w), r(w);
+        for (int i = 0; i < w; i++) q[i] = fresh();
+        for (int i = 0; i < w; i++) r[i] = fresh();
+
+        std::vector<int> q_ext(ew), r_ext(ew), a_ext(ew);
+        for (int i = 0; i < k; i++) { q_ext[i] = CONST_FALSE(); r_ext[i] = CONST_FALSE(); a_ext[i] = CONST_FALSE(); }
+        for (int i = 0; i < w; i++) { q_ext[k + i] = q[i]; r_ext[k + i] = r[i]; a_ext[k + i] = a[i]; }
+
+        std::vector<int> cq = bv_mul_by_sparse_const(q_ext, c, ew);
+        std::vector<int> sum = bv_add(cq, r_ext);
+        // Hard-assert sum == a_ext, bit by bit -- cheaper than building an
+        // extra bv_eq AND-tree we'd only ever force to true.
+        for (int i = 0; i < ew; i++) {
+            addClauseLits({sum[i], -a_ext[i]});
+            addClauseLits({-sum[i], a_ext[i]});
+        }
+        // Hard-assert r < c, which together with the equation above pins
+        // q/r to the unique correct (floor-division) quotient/remainder.
+        std::vector<int> c_bits = int_to_bits(c, w);
+        int r_lt_c = bv_ult(r, c_bits);
+        addClauseLits({r_lt_c});
+
+        q_out = q;
+        r_out = r;
+    }
+
     int bv_eq(const std::vector<int> &a, const std::vector<int> &b) {
         std::vector<int> eq_bits(a.size());
         for (size_t i = 0; i < a.size(); i++) eq_bits[i] = gate_not(gate_xor(a[i], b[i]));
@@ -991,34 +1041,99 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
             out = bl.bv_mul(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
         }
     } else if (n.op == "bvudiv") {
-        // x udiv 2^k = x >> k, unsigned only. b here is a concrete nonzero
-        // constant (power of 2), so the divide-by-zero case of bv_bvudiv
-        // can never apply and is safely skipped.
+        // x udiv 2^k = x >> k, unsigned only (free, pure rewiring). For any
+        // other known nonzero constant divisor, use the relational
+        // constant-divisor encoding (bv_reldiv_by_const) instead of the
+        // general O(w^2) restoring-division circuit -- see that function's
+        // comment for why this is sound and cheap specifically because the
+        // divisor is a compile-time constant. b==0 (divide by zero, whose
+        // SMT-LIB2 result is all-ones) and non-constant divisors still fall
+        // back to the fully general bv_bvudiv.
         int w = n.width;
         uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
-        Node &rhs = nodes[n.args[1]];
-        int k;
-        if (rhs.op == "bvlit" && isPow2Const((uint64_t)rhs.value & mask, k)) {
-            out = bl.bv_lshr_const(blastBV(bl, nodes, res, n.args[0]), k);
+        uint64_t cv; int cw; int k;
+        if (tryConstEval(nodes, n.args[1], cv, cw) && (cv &= mask) != 0) {
+            if (isPow2Const(cv, k)) {
+                out = bl.bv_lshr_const(blastBV(bl, nodes, res, n.args[0]), k);
+            } else {
+                std::vector<int> q, r;
+                bl.bv_reldiv_by_const(blastBV(bl, nodes, res, n.args[0]), cv, w, q, r);
+                out = q;
+            }
         } else {
             out = bl.bv_bvudiv(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
         }
     } else if (n.op == "bvurem") {
-        // x urem 2^k = x & (2^k - 1), unsigned only; same zero-divisor
-        // reasoning as bvudiv above.
+        // x urem 2^k = x & (2^k - 1), unsigned only; same reasoning as
+        // bvudiv above (zero-divisor and non-constant cases fall back to
+        // the general circuit).
         int w = n.width;
         uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
-        Node &rhs = nodes[n.args[1]];
-        int k;
-        if (rhs.op == "bvlit" && isPow2Const((uint64_t)rhs.value & mask, k)) {
-            out = bl.bv_urem_pow2_const(blastBV(bl, nodes, res, n.args[0]), k);
+        uint64_t cv; int cw; int k;
+        if (tryConstEval(nodes, n.args[1], cv, cw) && (cv &= mask) != 0) {
+            if (isPow2Const(cv, k)) {
+                out = bl.bv_urem_pow2_const(blastBV(bl, nodes, res, n.args[0]), k);
+            } else {
+                std::vector<int> q, r;
+                bl.bv_reldiv_by_const(blastBV(bl, nodes, res, n.args[0]), cv, w, q, r);
+                out = r;
+            }
         } else {
             out = bl.bv_bvurem(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
         }
     } else if (n.op == "bvsdiv") {
-        out = bl.bv_bvsdiv(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        // Signed division by a known nonzero constant: since abs(c) is
+        // itself a compile-time constant, reduce to the same relational
+        // constant-divisor trick on magnitudes, then reapply the usual
+        // sign correction (mirrors bv_bvsdiv's own magnitude decomposition,
+        // just with the cheap constant-divisor unsigned division instead
+        // of bv_udivrem). This is the actual dominant case found in the
+        // real RERS corpus (~1,330 sdiv/srem-by-constant operations).
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        uint64_t cv; int cw;
+        if (tryConstEval(nodes, n.args[1], cv, cw) && (cv &= mask) != 0) {
+            bool b_sign_known = (cv >> (w - 1)) & 1ULL;
+            uint64_t abs_c = b_sign_known ? ((~cv + 1ULL) & mask) : cv;
+            std::vector<int> a = blastBV(bl, nodes, res, n.args[0]);
+            int a_sign = a[0];
+            std::vector<int> a_neg = bl.bv_neg(a);
+            std::vector<int> a_mag(w);
+            for (int i = 0; i < w; i++) a_mag[i] = bl.gate_ite(a_sign, a_neg[i], a[i]);
+            std::vector<int> q_mag, r_mag;
+            bl.bv_reldiv_by_const(a_mag, abs_c, w, q_mag, r_mag);
+            std::vector<int> q_neg = bl.bv_neg(q_mag);
+            int sign_differs = b_sign_known ? bl.gate_not(a_sign) : a_sign;
+            std::vector<int> result(w);
+            for (int i = 0; i < w; i++) result[i] = bl.gate_ite(sign_differs, q_neg[i], q_mag[i]);
+            out = result;
+        } else {
+            out = bl.bv_bvsdiv(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        }
     } else if (n.op == "bvsrem") {
-        out = bl.bv_bvsrem(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        // Same constant-magnitude reduction as bvsdiv above; remainder
+        // sign follows the dividend a (not the divisor), matching
+        // bv_bvsrem's existing convention.
+        int w = n.width;
+        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+        uint64_t cv; int cw;
+        if (tryConstEval(nodes, n.args[1], cv, cw) && (cv &= mask) != 0) {
+            bool b_sign_known = (cv >> (w - 1)) & 1ULL;
+            uint64_t abs_c = b_sign_known ? ((~cv + 1ULL) & mask) : cv;
+            std::vector<int> a = blastBV(bl, nodes, res, n.args[0]);
+            int a_sign = a[0];
+            std::vector<int> a_neg = bl.bv_neg(a);
+            std::vector<int> a_mag(w);
+            for (int i = 0; i < w; i++) a_mag[i] = bl.gate_ite(a_sign, a_neg[i], a[i]);
+            std::vector<int> q_mag, r_mag;
+            bl.bv_reldiv_by_const(a_mag, abs_c, w, q_mag, r_mag);
+            std::vector<int> r_neg = bl.bv_neg(r_mag);
+            std::vector<int> result(w);
+            for (int i = 0; i < w; i++) result[i] = bl.gate_ite(a_sign, r_neg[i], r_mag[i]);
+            out = result;
+        } else {
+            out = bl.bv_bvsrem(blastBV(bl, nodes, res, n.args[0]), blastBV(bl, nodes, res, n.args[1]));
+        }
     } else if (n.op == "bvneg") {
         out = bl.bv_neg(blastBV(bl, nodes, res, n.args[0]));
     } else if (n.op == "bvnot") {
