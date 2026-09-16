@@ -216,7 +216,28 @@ struct Blaster {
 
     int gate_not(int a) { return -a; }
 
+    // Constant/structural identity short-circuits, applied uniformly at
+    // every gate construction site (not just a few reactive call sites) --
+    // this is the same family of rule Bitwuzla's AIG layer applies
+    // globally (idempotence/neutrality/contradiction/subsumption), found
+    // to be MISSING here via direct profiling of a real array-heavy RERS
+    // formula (captured_prob13.smt2): the array-consistency-axiom loop in
+    // blastSelect builds an ite(idx_i==idx_j, ...) for every (select,
+    // prior-select) pair on the same array, and whenever both indices are
+    // compile-time constants (common for concrete array offsets), the
+    // equality is a compile-time-decidable constant -- but without these
+    // checks, gate_and/gate_xor/gate_ite would still allocate a fresh SAT
+    // variable and clauses for it regardless, an entirely avoidable cost
+    // that compounds quadratically with the number of selects. Placed
+    // before the cache lookup: a short-circuited result needs no cache
+    // entry (and skips the lookup itself).
     int gate_and(int a, int b) {
+        int T = CONST_TRUE(), F = CONST_FALSE();
+        if (a == F || b == F) return F;
+        if (a == T) return b;
+        if (b == T) return a;
+        if (a == b) return a;
+        if (a == -b) return F; // a AND NOT a
         std::pair<int,int> key = (a <= b) ? std::make_pair(a, b) : std::make_pair(b, a);
         auto it = andCache.find(key);
         if (it != andCache.end()) {
@@ -234,6 +255,12 @@ struct Blaster {
         return y;
     }
     int gate_or(int a, int b) {
+        int T = CONST_TRUE(), F = CONST_FALSE();
+        if (a == T || b == T) return T;
+        if (a == F) return b;
+        if (b == F) return a;
+        if (a == b) return a;
+        if (a == -b) return T; // a OR NOT a
         int y = fresh();
         addClauseLits({y, -a});
         addClauseLits({y, -b});
@@ -241,6 +268,13 @@ struct Blaster {
         return y;
     }
     int gate_xor(int a, int b) {
+        int T = CONST_TRUE(), F = CONST_FALSE();
+        if (a == F) return b;
+        if (b == F) return a;
+        if (a == T) return gate_not(b);
+        if (b == T) return gate_not(a);
+        if (a == b) return F;
+        if (a == -b) return T;
         std::pair<int,int> key = (a <= b) ? std::make_pair(a, b) : std::make_pair(b, a);
         auto it = xorCache.find(key);
         if (it != xorCache.end()) {
@@ -259,6 +293,12 @@ struct Blaster {
         return y;
     }
     int gate_ite(int c, int t, int e) {
+        int T = CONST_TRUE(), F = CONST_FALSE();
+        if (c == T) return t;
+        if (c == F) return e;
+        if (t == e) return t;
+        if (t == T && e == F) return c;
+        if (t == F && e == T) return gate_not(c);
         int y = fresh();
         addClauseLits({-y, -c, t});
         addClauseLits({-y, c, e});
