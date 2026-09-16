@@ -770,6 +770,17 @@ struct IRResult {
     // a bug in the static check, not a normal formula -- fail loudly
     // instead of blowing the C++ stack.
     std::unordered_set<int> substInProgress;
+    // Array-sorted analogue of substMap: top-level "arrVar = expr"
+    // equalities where arrVar is an array-sorted bare variable (found
+    // missing via a new differential test -- buildSubstitutions used to
+    // fold these into substMap indiscriminately, but blastSelect never
+    // consulted substMap, so the array definition was silently ignored
+    // (or, worse, blastBV was later force-called on the array-sorted
+    // replacement node during the substMap force-blast pass and crashed
+    // with "unsupported BV op in IR: store"). Consulted inside
+    // blastSelect's chain walk, mirroring how substMap is consulted at
+    // the top of blastBV/blastBool.
+    std::unordered_map<int, int> arrayAliasMap;
 };
 
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid);
@@ -812,6 +823,24 @@ std::vector<int> blastSelect(Blaster &bl, std::vector<Node> &nodes, IRResult &re
         bool expanded = stack.back().second;
         stack.pop_back();
         if (results.count(nodeId)) continue;
+
+        // Array-alias resolution (SSA-eliminated "arrVar = expr"
+        // definitions, see IRResult::arrayAliasMap) -- must be checked
+        // before dispatching on node.op, using the same two-phase
+        // expanded-flag pattern as the store/ite cases below, so an
+        // aliased array var routes through to its real definition instead
+        // of being wrongly treated as an opaque, unconstrained base array.
+        auto aliasIt = res.arrayAliasMap.find(nodeId);
+        if (aliasIt != res.arrayAliasMap.end()) {
+            if (!expanded) {
+                stack.push_back({nodeId, true});
+                stack.push_back({aliasIt->second, false});
+                continue;
+            }
+            results[nodeId] = results[aliasIt->second];
+            continue;
+        }
+
         Node &node = nodes[nodeId];
 
         if (node.op == "store") {
@@ -861,10 +890,36 @@ std::vector<int> blastSelect(Blaster &bl, std::vector<Node> &nodes, IRResult &re
         // peel further). Key by variable name, not node id -- the parser
         // can build multiple Node objects referring to "the same array".
         std::string arrKey = (node.op == "var") ? node.name : ("#anon" + std::to_string(nodeId));
+
+        // Literal-index-identity fast path: if this select's idxBits are
+        // bit-for-bit the SAME SAT literals as an earlier select already
+        // resolved against this array (common when two syntactically
+        // different index expressions -- e.g. reached through different
+        // let-bindings or SSA-substitution paths -- end up blasting to the
+        // identical literal vector), the array-read result MUST be
+        // identical too: skip allocating a fresh result var and the whole
+        // O(prior) consistency loop below entirely, just alias the
+        // existing answer. Always safe (a stronger, cheaper substitute for
+        // one specific pairwise check, never changes what's satisfiable)
+        // and a direct, portable analogue of the index deduplication CBMC
+        // does upfront in collect_indices() -- found by reading CBMC's
+        // real array-flattening source (arrays.cpp) to understand why its
+        // default config is so much faster than NeuroSym's array handling
+        // on real array-heavy formulas.
+        auto &prior = res.arrayReads[arrKey];
+        bool _dupFound = false;
+        for (auto &pr : prior) {
+            if (pr.first == idxBits) {
+                results[nodeId] = pr.second;
+                _dupFound = true;
+                break;
+            }
+        }
+        if (_dupFound) continue;
+
         std::vector<int> resultBits(width);
         for (int k = 0; k < width; k++) resultBits[k] = bl.fresh();
 
-        auto &prior = res.arrayReads[arrKey];
         for (auto &pr : prior) {
             int idxEq = bl.bv_eq(idxBits, pr.first);
             for (int k = 0; k < width; k++) {
@@ -1583,7 +1638,32 @@ static void buildSubstitutions(IR &ir, IRResult &res) {
         }
     }
 
+    // Split by sort: array-sorted definitions go to arrayAliasMap
+    // (consulted by blastSelect), everything else stays in substMap
+    // (consulted by blastBV/blastBool) -- see IRResult::arrayAliasMap's
+    // comment for why these must not be conflated. Built as a bulk copy
+    // followed by erase(), NOT a from-scratch element-by-element loop:
+    // an unordered_map's iteration order is affected by exactly how it
+    // was built, and substMap's iteration order is NOT cosmetic -- the
+    // force-blast loop below walks it directly, and that walk order
+    // determines the order fresh SAT variables get created in, which
+    // measurably perturbs MiniSat's search (found via a real regression:
+    // an earlier from-scratch-loop version of this split, despite
+    // producing an IDENTICAL set of key/value pairs, took a real RERS
+    // benchmark from 35s to a 90s+ timeout on a formula with zero array
+    // content at all -- i.e. arrayAliasMap provably empty -- purely from
+    // this incidental reordering). Copying via "=" first preserves
+    // substMap's original construction provenance for the common
+    // (no-array-substitution) case, where this loop is then a no-op.
     res.substMap = tentative;
+    for (auto it = res.substMap.begin(); it != res.substMap.end(); ) {
+        if (ir.nodes[it->first].isArray) {
+            res.arrayAliasMap[it->first] = it->second;
+            it = res.substMap.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     std::vector<int> kept;
     for (size_t ai = 0; ai < ir.assertions.size(); ai++)
