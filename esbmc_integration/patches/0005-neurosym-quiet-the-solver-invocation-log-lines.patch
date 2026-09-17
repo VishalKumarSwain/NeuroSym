@@ -1,0 +1,105 @@
+From bbdac3d4a74fa0ee9403480f7714fe468e364ef3 Mon Sep 17 00:00:00 2001
+From: Vishal Kumar Swain <vkswain50@gmail.com>
+Date: Thu, 17 Sep 2026 12:42:32 +0530
+Subject: [PATCH] neurosym: quiet the solver-invocation log lines
+
+Two ESBMC log lines were unnecessarily verbose for the NeuroSym backend
+specifically (and, for one of them, for every process-based smtlib
+backend in general):
+
+1. neurosym_convt::solver_text() built "NeuroSym '<full command>'",
+   printing the entire --neurosym-prog command line (path + every flag
+   + the %f placeholder) via log_progress every run. Every other solver
+   just prints a short name+version (e.g. "Z3 v4.13.3"). Changed to
+   just return "NeuroSym".
+
+2. smtlib_convt::solver_text() (the shared base class also used by
+   Bitwuzllob) had the same issue for the generic --smtlib-solver-prog
+   case: it returned the full command line. Shortened to the program's
+   basename only.
+
+3. oneshot_process.cpp separately logged "Running {name}: {cmd}" (the
+   fully-substituted command, including the temp formula path) via
+   log_status on every single solve call -- demoted to log_debug, so
+   it's hidden at normal verbosity but still available for anyone
+   actually debugging the solver integration.
+
+Net effect for a NeuroSym run: what used to be two lines --
+
+  [PROGRESS] Solving with solver NeuroSym '/path/to/neurosym-cpp-solve %f'
+  Running neurosym: /path/to/neurosym-cpp-solve '/tmp/esbmc-neurosym-xxxx.smt2'
+
+-- is now one:
+
+  Solving with solver NeuroSym
+
+Cosmetic only: does not change solving behaviour, timing, or results.
+---
+ src/solvers/neurosym/neurosym_conv.cpp |  6 +++++-
+ src/solvers/smtlib/oneshot_process.cpp |  7 ++++++-
+ src/solvers/smtlib/smtlib_conv.cpp     | 16 +++++++++++++++-
+ 3 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/src/solvers/neurosym/neurosym_conv.cpp b/src/solvers/neurosym/neurosym_conv.cpp
+index 2311787a35..156e3d9e7e 100644
+--- a/src/solvers/neurosym/neurosym_conv.cpp
++++ b/src/solvers/neurosym/neurosym_conv.cpp
+@@ -975,5 +975,9 @@ BigInt neurosym_convt::get_bv(smt_astt a, bool is_signed)
+ 
+ const std::string neurosym_convt::solver_text()
+ {
+-  return "NeuroSym '" + prog_command(options) + "'";
++  // Just the friendly name -- the full invocation (path + every flag +
++  // the temp formula path) is verbose noise at normal verbosity; it is
++  // still available via log_debug("solver", ...) in oneshot_process.cpp
++  // for anyone who needs the exact command.
++  return "NeuroSym";
+ }
+diff --git a/src/solvers/smtlib/oneshot_process.cpp b/src/solvers/smtlib/oneshot_process.cpp
+index e4b813cfcf..001cdd6ee8 100644
+--- a/src/solvers/smtlib/oneshot_process.cpp
++++ b/src/solvers/smtlib/oneshot_process.cpp
+@@ -126,7 +126,12 @@ smt_resultt run_solver(
+       pos += quoted_path.size();
+     }
+ 
+-  log_status("Running {}: {}", name, cmd);
++  // Demoted from log_status to log_debug: the exact subprocess command
++  // (full path + every flag + the temp formula path) is useful when
++  // debugging the solver integration, but is noise at normal verbosity
++  // -- solver_text() above already prints a short, friendly name for
++  // the routine "which solver is running" case.
++  log_debug("solver", "Running {}: {}", name, cmd);
+ 
+ #ifdef _WIN32
+   FILE *out = popen(cmd.c_str(), "r");
+diff --git a/src/solvers/smtlib/smtlib_conv.cpp b/src/solvers/smtlib/smtlib_conv.cpp
+index 9c2c6d42c1..0005da23a8 100644
+--- a/src/solvers/smtlib/smtlib_conv.cpp
++++ b/src/solvers/smtlib/smtlib_conv.cpp
+@@ -903,7 +903,21 @@ tvt smtlib_convt::get_bool(smt_astt a)
+ const std::string smtlib_convt::solver_text()
+ {
+   if (emit_proc)
+-    return "'" + options.get_option("smtlib-solver-prog") + "'";
++  {
++    // Show a short, friendly label instead of the full command line (path
++    // + all flags + %f placeholder) -- this backend is shared by several
++    // process-based solvers (bitwuzla-via-pipe, NeuroSym, ...), and the
++    // full invocation is verbose noise at normal verbosity here; the
++    // exact command actually run is still available via log_debug in
++    // oneshot_process.cpp for anyone who needs it.
++    std::string prog = options.get_option("smtlib-solver-prog");
++    size_t sp = prog.find(' ');
++    std::string first_tok = (sp == std::string::npos) ? prog : prog.substr(0, sp);
++    size_t slash = first_tok.find_last_of('/');
++    std::string base =
++      (slash == std::string::npos) ? first_tok : first_tok.substr(slash + 1);
++    return base.empty() ? prog : base;
++  }
+ 
+   if (emit_opt_output)
+     return "Text output";
+-- 
+2.34.1
+
