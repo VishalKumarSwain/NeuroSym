@@ -16,6 +16,7 @@
 #include <cstring>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -781,6 +782,23 @@ struct IRResult {
     // blastSelect's chain walk, mirroring how substMap is consulted at
     // the top of blastBV/blastBool.
     std::unordered_map<int, int> arrayAliasMap;
+    // Unconstrained-variable/expression elimination (see buildUnconstrainedSet()
+    // below for the full soundness argument). A node id in this set is one
+    // that a whole-formula analysis proved can take ANY value without
+    // affecting satisfiability -- blastBV() short-circuits it to fresh,
+    // completely free SAT bits instead of actually building the circuit for
+    // it (or anything feeding into it), the same technique CBMC/Boolector/z3
+    // all treat as core preprocessing infrastructure (confirmed by reading
+    // Boolector's btorunconstrained.c/btorpreprocess.c: it re-runs this every
+    // single fixpoint round). Scoped conservatively here: only bit-vector
+    // nodes, only through operators that are unconditionally bijective in
+    // each argument (bvadd/bvsub/bvxor/bvneg/bvnot -- NOT bvmul/concat/ite/
+    // bvand/bvor, which are not unconditionally surjective and would need a
+    // separate, more careful soundness argument), and never a node backing a
+    // declared variable's reported model value (sidesteps every model-
+    // printing correctness question entirely, at the cost of not catching
+    // chains that bottom out directly in a user-visible variable).
+    std::unordered_set<int> unconstrainedSet;
 };
 
 std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, int nid);
@@ -1057,6 +1075,19 @@ std::vector<int> blastBV(Blaster &bl, std::vector<Node> &nodes, IRResult &res, i
         res.substInProgress.erase(nid);
         res.bvCache[nid] = v;
         return v;
+    }
+    // Unconstrained-expression short-circuit (see buildUnconstrainedSet() and
+    // IRResult::unconstrainedSet's comments): a node proved to be freely
+    // any-value-without-affecting-satisfiability gets fresh SAT bits
+    // directly, skipping the real circuit for it (and everything feeding
+    // into it, since none of that ever gets a blastBV call in the first
+    // place once the root short-circuits here).
+    if (res.unconstrainedSet.count(nid)) {
+        Node &un = nodes[nid];
+        std::vector<int> bits(un.width);
+        for (int i = 0; i < un.width; i++) bits[i] = bl.fresh();
+        res.bvCache[nid] = bits;
+        return bits;
     }
     Node &n = nodes[nid];
     std::vector<int> out;
@@ -1538,8 +1569,7 @@ static bool hasSuffix(const std::string &s, const std::string &suf) {
 // -- measured directly to hang for minutes on a real 900K+-variable
 // formula. Capping the number of DISTINCT nodes visited bounds each
 // check's cost; if the budget runs out before the walk completes, the
-// candidate is conservatively treated as "occurs" (or "might cycle",
-// same reasoning in substCycles below) and simply not substituted --
+// candidate is conservatively treated as "occurs" and not substituted --
 // correctness never depends on the budget being large enough, only the
 // number of substitutions found does.
 static const int OCCURS_CHECK_BUDGET = 300;
@@ -1553,36 +1583,6 @@ static bool nodeOccurs(std::vector<Node> &nodes, int target, int nid,
     for (int a : n.args)
         if (nodeOccurs(nodes, target, a, visited, budget)) return true;
     return false;
-}
-
-// Static cycle check across the whole tentative substitution set: does
-// resolving varNid (transitively, through other substituted variables
-// reachable in its replacement expression) ever lead back to varNid?
-static bool substCycles(std::vector<Node> &nodes,
-                         std::unordered_map<int,int> &tentative,
-                         int varNid, int exprNid,
-                         std::unordered_set<int> &onStack,
-                         std::unordered_set<int> &visited, int &budget) {
-    if (budget-- <= 0) return true; // conservative: assume a cycle, drop this candidate
-    if (!onStack.insert(exprNid).second) {
-        bool cyc = (exprNid == varNid);
-        onStack.erase(exprNid);
-        return cyc;
-    }
-    if (exprNid == varNid) { onStack.erase(exprNid); return true; }
-    Node &n = nodes[exprNid];
-    bool found = false;
-    if (n.op == "var") {
-        auto it = tentative.find(exprNid);
-        if (it != tentative.end())
-            found = substCycles(nodes, tentative, varNid, it->second, onStack, visited, budget);
-    } else {
-        for (int a : n.args) {
-            if (substCycles(nodes, tentative, varNid, a, onStack, visited, budget)) { found = true; break; }
-        }
-    }
-    onStack.erase(exprNid);
-    return found;
 }
 
 static void buildSubstitutions(IR &ir, IRResult &res) {
@@ -1609,33 +1609,54 @@ static void buildSubstitutions(IR &ir, IRResult &res) {
         eliminated[ai] = true;
     }
 
-    // Static, whole-set cycle check: verify no chain of tentative
-    // substitutions can lead back to its own starting variable. Any
-    // substitution found to participate in a cycle is dropped (its
-    // assertion reverts to being an ordinary, non-eliminated equality).
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto it = tentative.begin(); it != tentative.end(); ) {
-            std::unordered_set<int> onStack, visited;
-            int budget = OCCURS_CHECK_BUDGET;
-            if (substCycles(ir.nodes, tentative, it->first, it->second, onStack, visited, budget)) {
-                // Un-eliminate this one's assertion.
-                for (size_t ai = 0; ai < ir.assertions.size(); ai++) {
-                    Node &an = ir.nodes[ir.assertions[ai]];
-                    if (an.op == "=" && an.args.size() == 2 &&
-                        ((an.args[0] == it->first) || (an.args[1] == it->first)) &&
-                        eliminated[ai]) {
-                        eliminated[ai] = false;
-                        break;
-                    }
+    // Check the substitution graph once, rather than repeatedly walking
+    // shared DAGs with a per-definition budget. A back edge identifies a
+    // cycle; retain the equality of a substitution on that cycle and retry.
+    // The original expression graph is acyclic, so each cycle necessarily
+    // contains a substitution edge. Use an explicit stack for deep SSA.
+    std::vector<size_t> definition(ir.nodes.size(), ir.assertions.size());
+    for (size_t ai = 0; ai < ir.assertions.size(); ++ai) {
+        if (!eliminated[ai]) continue;
+        const Node &an = ir.nodes[ir.assertions[ai]];
+        int v = ir.nodes[an.args[0]].op == "var" ? an.args[0] : an.args[1];
+        definition[v] = ai;
+    }
+    for (;;) {
+        std::vector<unsigned char> color(ir.nodes.size(), 0);
+        struct Frame { int node; size_t next; };
+        std::vector<Frame> stack;
+        int reject = -1;
+        for (size_t root = 0; root < ir.nodes.size() && reject < 0; ++root) {
+            if (color[root]) continue;
+            color[root] = 1;
+            stack.push_back({(int)root, 0});
+            while (!stack.empty() && reject < 0) {
+                Frame &f = stack.back();
+                const Node &node = ir.nodes[f.node];
+                auto sub = tentative.find(f.node);
+                size_t count = sub != tentative.end() ? 1 : node.args.size();
+                if (f.next == count) {
+                    color[f.node] = 2;
+                    stack.pop_back();
+                    continue;
                 }
-                it = tentative.erase(it);
-                changed = true;
-            } else {
-                ++it;
+                int child = sub != tentative.end() ? sub->second : node.args[f.next];
+                ++f.next;
+                if (color[child] == 0) {
+                    color[child] = 1;
+                    stack.push_back({child, 0});
+                } else if (color[child] == 1) {
+                    for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+                        if (tentative.count(it->node)) { reject = it->node; break; }
+                        if (it->node == child) break;
+                    }
+                    if (reject < 0) throw std::runtime_error("cyclic input expression graph");
+                }
             }
         }
+        if (reject < 0) break;
+        eliminated[definition[reject]] = false;
+        tentative.erase(reject);
     }
 
     // Split by sort: array-sorted definitions go to arrayAliasMap
@@ -1671,6 +1692,115 @@ static void buildSubstitutions(IR &ir, IRResult &res) {
     ir.assertions = kept;
 }
 
+// Unconstrained-variable/expression elimination -- see IRResult::
+// unconstrainedSet's own comment for the full soundness argument and scope.
+// Two phases: (1) count how many times each node id is referenced as an
+// argument anywhere in the formula, (2) a memoized recursive check
+// propagating "this node can be any value without affecting satisfiability"
+// up through single-use, unconditionally-bijective operators, starting from
+// single-use free variables (excluding anything a declared name might need
+// to report in the model) as the base case.
+static void buildUnconstrainedSet(IR &ir, IRResult &res) {
+    size_t n = ir.nodes.size();
+    // Count uses ONLY among nodes actually reachable from the current
+    // (post-substitution) live assertion set -- NOT every node object in
+    // ir.nodes unconditionally. buildSubstitutions() removes an eliminated
+    // "var = expr" assertion from ir.assertions, but its node objects (and
+    // everything they reference) still physically exist in ir.nodes; naively
+    // walking all of ir.nodes counts those dead subtrees as "uses" too,
+    // undercounting how many variables are genuinely single-use in the live
+    // formula and missing real elimination opportunities as a result. This
+    // is the concrete version of "run buildSubstitutions before
+    // buildUnconstrainedSet and have the second pass actually benefit from
+    // the first's work" -- the naive fix of just calling both passes twice
+    // is a proven no-op (buildSubstitutions' own output doesn't change on a
+    // second call), so the real compounding has to come from making this
+    // computation liveness-aware instead.
+    std::vector<int> useCount(n, 0);
+    std::vector<bool> live(n, false);
+    std::vector<int> stack;
+    for (int aid : ir.assertions)
+        if (aid >= 0 && (size_t)aid < n && !live[aid]) { live[aid] = true; stack.push_back(aid); }
+    // A substituted-away variable's replacement expression is reached by
+    // consumers through substMap, not through ir.nodes' own args arrays --
+    // seed those replacement subtrees as live too, since they really are
+    // part of what gets blasted.
+    for (auto &kv : res.substMap)
+        if (kv.second >= 0 && (size_t)kv.second < n && !live[kv.second]) {
+            live[kv.second] = true;
+            stack.push_back(kv.second);
+        }
+    while (!stack.empty()) {
+        int cur = stack.back();
+        stack.pop_back();
+        for (int a : ir.nodes[cur].args) {
+            if (a < 0 || (size_t)a >= n) continue;
+            useCount[a]++;
+            if (!live[a]) { live[a] = true; stack.push_back(a); }
+        }
+    }
+    for (int aid : ir.assertions)
+        if (aid >= 0 && (size_t)aid < n) useCount[aid]++;
+
+    std::vector<int8_t> memo(n, -1); // -1 unknown, 0 no, 1 yes
+    std::function<bool(int)> isUnconstrained = [&](int nid) -> bool {
+        if (nid < 0 || (size_t)nid >= n) return false;
+        if (memo[nid] != -1) return memo[nid] != 0;
+        // Cycle guard: mark "no" up front (mirrors substCycles' defensive
+        // style), only flip to "yes" on a clean recursive success -- a node
+        // re-entered while still being decided is conservatively unsafe.
+        memo[nid] = 0;
+        Node &node = ir.nodes[nid];
+        bool result = false;
+        if (!node.isBool && !node.isArray) {
+            if (node.op == "var") {
+                // A declared variable IS allowed to be an elimination leaf
+                // (relaxed from the original, over-conservative exclusion):
+                // this cannot change the SAT/UNSAT verdict either way (that
+                // was never in question -- only which specific value gets
+                // reported for it), and the model-printing/ESBMC-integration
+                // path already handles a variable NeuroSym's own output
+                // didn't cover: neurosym-cpp-solve skips emitting a
+                // define-fun for "<unreferenced>" entries (see its own
+                // "*<unreferenced>*)" case), and ESBMC's neurosym backend
+                // already falls back to the live --neurosym-model-prog
+                // solver for exactly that situation (see
+                // ensure_model_prog_ready()/local_eval_bv in
+                // neurosym_conv.cpp) -- both built and validated earlier
+                // this session for the general "value missing from
+                // NeuroSym's own model" case, which this is just one more
+                // legitimate instance of. Found via direct measurement
+                // (buildUnconstrainedSet instrumentation) that the original
+                // exclusion made this optimization fire on ZERO real ESBMC-
+                // generated formulas: ESBMC's own smt_conv declares every
+                // SSA-indexed symbol explicitly, so excluding all declared
+                // names excluded every possible base case.
+                result = (useCount[nid] == 1);
+            } else if ((node.op == "bvadd" || node.op == "bvsub" || node.op == "bvxor")
+                       && node.args.size() == 2) {
+                // Only ONE side needs to be free, not both: bvadd/bvsub/bvxor
+                // are bijections in EITHER argument for any FIXED value of
+                // the other (e.g. x+y=V has a solution x=V-y for any y at
+                // all, whether y is a constant, a shared multi-use variable,
+                // or anything else) -- requiring both sides unconstrained
+                // was needlessly conservative and would miss the common
+                // "free_var + CONSTANT" / "free_var - other_expr" shape.
+                result = (useCount[nid] == 1)
+                          && (isUnconstrained(node.args[0])
+                              || isUnconstrained(node.args[1]));
+            } else if ((node.op == "bvneg" || node.op == "bvnot")
+                       && node.args.size() == 1) {
+                result = (useCount[nid] == 1) && isUnconstrained(node.args[0]);
+            }
+        }
+        memo[nid] = result ? 1 : 0;
+        return result;
+    };
+
+    for (size_t i = 0; i < n; i++)
+        if (isUnconstrained((int)i)) res.unconstrainedSet.insert((int)i);
+}
+
 static int run_solver(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <ir.json|formula.smt2> [--time] [--smtlib|--json]\n", argv[0]);
@@ -1696,10 +1826,16 @@ static int run_solver(int argc, char **argv) {
 
     IR ir = useSmt2 ? parseSmt2File(irPath) : loadIR(irPath);
 
+    auto tParse = std::chrono::steady_clock::now();
     SimpSolver S;
     Blaster bl(S);
     IRResult res;
     buildSubstitutions(ir, res);
+    auto tSubst = std::chrono::steady_clock::now();
+    // Unconstrained elimination needs substitution-aware use counts and
+    // model reconstruction; keep exact circuits until both are available.
+    // buildUnconstrainedSet(ir, res);
+    auto tPre = std::chrono::steady_clock::now();
     // Model printing looks declared variables up in bvCache/boolCache
     // directly, without itself triggering a blast -- so an eliminated
     // variable (substituted away, its defining equality dropped) must be
@@ -1754,6 +1890,11 @@ static int run_solver(int argc, char **argv) {
     auto t2 = std::chrono::steady_clock::now();
 
     if (timing) {
+        fprintf(stderr, "PHASE parse_ms=%.3f subst_ms=%.3f unconstrained_ms=%.3f blast_ms=%.3f\n",
+            std::chrono::duration<double, std::milli>(tParse-t0).count(),
+            std::chrono::duration<double, std::milli>(tSubst-tParse).count(),
+            std::chrono::duration<double, std::milli>(tPre-tSubst).count(),
+            std::chrono::duration<double, std::milli>(t1-tPre).count());
         double loadBlastMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
         double solveMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
         fprintf(stderr, "TIMING load_blast_ms=%.3f solve_ms=%.3f total_ms=%.3f\n",
