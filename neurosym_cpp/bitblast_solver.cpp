@@ -1753,7 +1753,29 @@ static void buildUnconstrainedSet(IR &ir, IRResult &res) {
         Node &node = ir.nodes[nid];
         bool result = false;
         if (!node.isBool && !node.isArray) {
-            if (node.op == "var") {
+            if (node.op == "var" && res.substMap.count(nid) == 0
+                       && res.arrayAliasMap.count(nid) == 0) {
+                // A node that is itself a substitution KEY (eliminated by
+                // buildSubstitutions -- e.g. "a = b+1") is NOT actually
+                // free, no matter what its raw structural use-count says:
+                // its value is DEFINED as whatever its substitution target
+                // resolves to, which can itself depend on other variables
+                // (transitively, through further substitutions) that are
+                // genuinely constrained elsewhere. Treating it as "free"
+                // here let a fabricated cyclic-definition case go through
+                // as satisfiable when it was genuinely UNSAT -- found via
+                // tests/test_cpp_substitutions.py's cycle_unsat case (a =
+                // b+1, b = c+1, c = a+1: the cycle check correctly keeps
+                // exactly one of the three as a real assertion and
+                // substitutes the other two, but "a" and "b" still each
+                // have a raw structural use-count of 1, since they're only
+                // *directly* referenced once each -- checking substMap
+                // membership before trusting that count fixes it. This is
+                // exactly the interaction bug this pass was disabled for
+                // when the new whole-graph cycle detection landed, since
+                // that fix substitutes far more variables than the old,
+                // overly-conservative budgeted check ever did, making this
+                // case far more likely to actually occur.
                 // A declared variable IS allowed to be an elimination leaf
                 // (relaxed from the original, over-conservative exclusion):
                 // this cannot change the SAT/UNSAT verdict either way (that
@@ -1834,7 +1856,7 @@ static int run_solver(int argc, char **argv) {
     auto tSubst = std::chrono::steady_clock::now();
     // Unconstrained elimination needs substitution-aware use counts and
     // model reconstruction; keep exact circuits until both are available.
-    // buildUnconstrainedSet(ir, res);
+    buildUnconstrainedSet(ir, res);
     auto tPre = std::chrono::steady_clock::now();
     // Model printing looks declared variables up in bvCache/boolCache
     // directly, without itself triggering a blast -- so an eliminated
