@@ -1,150 +1,91 @@
-# NeuroSym — Neural-Symbolic SMT Solver
+# NeuroSym — SMT Solver
 
-> A GAN-guided SMT solver targeting QF_LIA and QF_BV theories, submitted to **SMT-COMP 2026**.
+> A standalone C++ QF_BV SMT solver, integrated with ESBMC as an alternate solver backend.
 
-NeuroSym combines a custom **Iterative Refinement GAN** with a complete Z3-based fallback to solve Satisfiability Modulo Theories (SMT) problems. The GAN learns to generate satisfying assignments directly from formula encodings, dramatically reducing the search space before falling back to symbolic reasoning.
-
----
-
-## Features
-
-- **Iterative Refinement GAN** — novel architecture: initial guess + K×violation-guided refinement rounds
-- **QF_LIA support** — linear integer arithmetic (8576-dim formula encoding)
-- **QF_BV support** — bit-vector theory (10752-dim encoding, 16 BV operation types)
-- **KLEE plugin** — C++ `SolverImpl` backend to use NeuroSym as a KLEE solver
-- **SMT-COMP ready** — SMT-LIB 2 interface via `main.py` + Dockerfile
-- **Z3 fallback** — guaranteed completeness via Z3 when GAN candidates fail
+NeuroSym is a native C++ SMT-LIB2 solver: its own parser, Tseitin bit-blasting to CNF, and native MiniSat (SimpSolver) solving. It integrates into ESBMC via a `--neurosym-prog` backend, giving ESBMC an additional solver option alongside Z3, Boolector, CVC5, and Bitwuzla.
 
 ---
 
-## Architecture
+## Build
 
+```bash
+cd neurosym_cpp
+g++ -O2 -std=c++17 -o bitblast_solver bitblast_solver.cpp -lminisat
 ```
-Formula (SMT-LIB 2)
-       │
-       ▼
-  BV/LIA Encoder  ──►  Feature Vector (10752-dim / 8576-dim)
-       │
-       ▼
- InitialGuesser   ──►  x̂⁽⁰⁾  (initial candidate assignment)
-       │
-       ▼
- RefinementStep × K  ──►  x̂⁽¹⁾ → x̂⁽²⁾ → ... → x̂⁽ᴷ⁾
-  (violation-guided)
-       │
-       ▼
- Verify with Z3?  ──►  SAT → return model
-       │ NO
-       ▼
-   Z3 Fallback    ──►  SAT / UNSAT / UNKNOWN
-```
+
+Requires MiniSat's headers and shared library (`libminisat.so.2` or equivalent) available on the build system. The binary must be built at `neurosym_cpp/bitblast_solver`, right next to `bitblast_solver.cpp` — the wrapper scripts below locate it relative to their own location, not a hardcoded path.
 
 ---
 
-## Quick Start
+## Usage
 
-### Install dependencies
+### Standalone (SMT-LIB2 file)
+
 ```bash
-pip install -r requirements.txt
+./neurosym_cpp/bitblast_solver formula.smt2
 ```
 
-### Run solver (SMT-COMP interface)
-```bash
-# From file
-python main.py benchmark.smt2
+### As an ESBMC backend
 
-# From stdin
-echo "(set-logic QF_LIA)..." | python main.py --stdin
+Symlink the wrapper scripts onto your `$PATH`:
+
+```bash
+mkdir -p ~/bin
+ln -s "$(pwd)/neurosym_cpp/bin/neurosym-cpp-solve" ~/bin/neurosym-cpp-solve
+ln -s "$(pwd)/neurosym_cpp/bin/esbmc-neurosym-cpp" ~/bin/esbmc-neurosym-cpp
+export PATH="$HOME/bin:$PATH"   # add to ~/.bashrc to persist
 ```
 
-### Run tests
+Use symlinks, not copies — a plain copy loses the link back to this checkout and the scripts won't find `bitblast_solver` anymore.
+
+Then run:
+
 ```bash
-python tests/test_pipeline.py       # 11 QF_LIA tests
-python tests/test_bv_pipeline.py    # 14 QF_BV tests
+esbmc --neurosym program.c
 ```
 
-### Train the GAN
-```bash
-# Generate synthetic benchmarks + train QF_BV model
-python scripts/train_bv.py --synthetic --data data/bv_benchmarks --epochs 50
+If your ESBMC build doesn't already default `--neurosym-prog` to `neurosym-cpp-solve`, pass it explicitly:
 
-# Download real benchmarks + train
-python scripts/download_bv_benchmarks.py --out data/bv_benchmarks
-python scripts/train_bv.py --data data/bv_benchmarks --epochs 50 --out models/gansat_bv.pt
+```bash
+esbmc --neurosym --neurosym-prog "$HOME/bin/neurosym-cpp-solve %f" program.c
 ```
 
-### Docker (SMT-COMP submission)
+For just the SAT/UNSAT verdict without building a full counterexample trace:
+
 ```bash
-docker build -t neurosym .
-echo "(set-logic QF_LIA)..." | docker run -i neurosym --stdin
+esbmc --neurosym --neurosym-prog "$HOME/bin/neurosym-cpp-solve %f" --result-only program.c
+```
+
+Full counterexample-trace building for formulas involving sign/zero-extend still requires a live SMT-LIB2 solver for model completion (a gap in ESBMC's own local model evaluator, not this solver):
+
+```bash
+esbmc --neurosym --neurosym-prog "$HOME/bin/neurosym-cpp-solve %f" --neurosym-model-prog "z3 -in" program.c
 ```
 
 ---
 
-## KLEE Integration
+## Supported theory
 
-Patch an existing KLEE source tree to use NeuroSym as a solver backend:
-
-```bash
-chmod +x klee_plugin/patch_klee.sh
-./klee_plugin/patch_klee.sh /path/to/klee/source
-
-# Build KLEE
-cd /path/to/klee/build && cmake .. -DENABLE_SOLVER_Z3=ON && make -j$(nproc)
-
-# Run KLEE with NeuroSym
-klee --solver-backend=gansat --gansat-model=models/gansat_bv.pt program.bc
-```
+QF_BV (bit-vectors), including array theory (`select`/`store`) via read-over-write encoding. No LIA (linear integer arithmetic) support. See [neurosym_cpp/README.md](neurosym_cpp/README.md) for full details, known limitations, and validation status.
 
 ---
 
-## Project Structure
+## Tests
 
-```
-NeuroSym/
-├── gansat/
-│   ├── parser.py        # SMT-LIB 2 parser (Z3-based)
-│   ├── encoder.py       # QF_LIA feature encoder (8576-dim)
-│   ├── bv_encoder.py    # QF_BV feature encoder (10752-dim)
-│   ├── gan.py           # Iterative Refinement GAN (QF_LIA)
-│   ├── bv_gan.py        # Iterative Refinement GAN (QF_BV)
-│   └── solver.py        # Unified solver dispatcher
-├── klee_plugin/
-│   ├── gansat_solver.h/.cpp   # KLEE C++ SolverImpl
-│   ├── gansat_bridge.py       # Python subprocess bridge
-│   ├── patch_klee.sh          # Auto-patch KLEE source
-│   └── CMakeLists.txt
-├── scripts/
-│   ├── train.py               # QF_LIA GAN training
-│   ├── train_bv.py            # QF_BV GAN training
-│   └── download_bv_benchmarks.py
-├── tests/
-│   ├── test_pipeline.py       # 11 QF_LIA tests
-│   └── test_bv_pipeline.py    # 14 QF_BV tests
-├── main.py                    # SMT-COMP entry point
-├── Dockerfile
-└── requirements.txt
+```bash
+python3 tests/test_cpp_substitutions.py   # differential tests against Z3 (substitution/cycle-detection soundness)
+python3 tests/test_ssa_substitution.py
+python3 tests/test_word_rewrites.py
+python3 tests/test_bvdiv_const.py
+python3 tests/test_bvmul_sparse_const.py
+python3 tests/test_array_select_dedup.py
 ```
 
 ---
 
 ## Mathematical Details
 
-See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) for:
-- Full formula encoding equations
-- ViolationComputer derivation
-- Iterative refinement forward pass
-- Training objectives and gradient flow
-- Parameter counts (~12.1M total)
-
----
-
-## Results
-
-| Theory | Test Cases | SAT Accuracy | Avg Latency |
-|--------|-----------|-------------|-------------|
-| QF_LIA | 11 | 100% (Z3 fallback) | ~25ms |
-| QF_BV  | 14 | 100% (Z3 fallback) | ~20ms |
+See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) and [NeuroSym_System_Description.tex](NeuroSym_System_Description.tex) for background on the solver's design.
 
 ---
 
@@ -161,4 +102,3 @@ See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) for:
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
