@@ -1831,6 +1831,7 @@ static int run_solver(int argc, char **argv) {
     std::string irPath = argv[1];
     bool timing = false;
     bool forceSmt2 = false, forceJson = false;
+    bool esbmcModel = false;
     bool modelSorts = false; // append " : (_ BitVec N)"/" : Bool" to each model line,
                               // so a pure-shell caller can build ESBMC's (model ...)
                               // block without needing separate declare-fun metadata
@@ -1841,6 +1842,7 @@ static int run_solver(int argc, char **argv) {
         else if (a == "--smtlib") forceSmt2 = true;
         else if (a == "--json") forceJson = true;
         else if (a == "--model-sorts") modelSorts = true;
+        else if (a == "--esbmc-model") esbmcModel = true;
     }
     bool useSmt2 = forceSmt2 || (!forceJson && (hasSuffix(irPath, ".smt2") || hasSuffix(irPath, ".smt")));
 
@@ -1931,25 +1933,41 @@ static int run_solver(int argc, char **argv) {
         return 0;
     }
     printf("sat\n");
+    if (esbmcModel) printf("(model\n");
 
+    auto emitBoolModel = [&](const std::string &name, bool val) {
+        if (esbmcModel)
+            printf("  (define-fun %s () Bool %s)\n", name.c_str(), val ? "true" : "false");
+        else if (modelSorts)
+            printf("%s = %s : Bool\n", name.c_str(), val ? "true" : "false");
+        else
+            printf("%s = %s\n", name.c_str(), val ? "true" : "false");
+    };
     for (auto &d : ir.declares) {
         auto it = nameToNodeId.find(d.name);
-        if (it == nameToNodeId.end()) { printf("%s = <unreferenced>\n", d.name.c_str()); continue; }
+        if (it == nameToNodeId.end()) {
+            // A declared Boolean with no expression node is unconstrained.
+            if (d.isBool) emitBoolModel(d.name, false);
+            else if (!esbmcModel) printf("%s = <unreferenced>\n", d.name.c_str());
+            continue;
+        }
         int nid = it->second;
         if (d.isBool) {
             auto bit = res.boolCache.find(nid);
-            if (bit == res.boolCache.end()) { printf("%s = <unreferenced>\n", d.name.c_str()); continue; }
+            if (bit == res.boolCache.end()) {
+                // Boolean terms are never discarded by BV unconstrained
+                // elimination; an unblasted Boolean has no live constraint.
+                emitBoolModel(d.name, false);
+                continue;
+            }
             int lit = bit->second;
             int var = (lit > 0 ? lit : -lit) - 1;
             lbool v = S.model[var];
             bool val = (lit > 0) ? (v == l_True) : (v == l_False);
-            if (modelSorts)
-                printf("%s = %s : Bool\n", d.name.c_str(), val ? "true" : "false");
-            else
-                printf("%s = %s\n", d.name.c_str(), val ? "true" : "false");
+            emitBoolModel(d.name, val);
         } else {
             auto bit = res.bvCache.find(nid);
-            if (bit == res.bvCache.end()) { printf("%s = <unreferenced>\n", d.name.c_str()); continue; }
+            if (bit == res.bvCache.end()) { if (!esbmcModel) printf("%s = <unreferenced>\n", d.name.c_str()); continue; }
             const std::vector<int> &bits = bit->second;
             uint64_t val = 0;
             for (size_t i = 0; i < bits.size(); i++) {
@@ -1959,12 +1977,15 @@ static int run_solver(int argc, char **argv) {
                 bool b = (lit > 0) ? (v == l_True) : (v == l_False);
                 val = (val << 1) | (b ? 1ULL : 0ULL);
             }
-            if (modelSorts)
+            if (esbmcModel)
+                printf("  (define-fun %s () (_ BitVec %d) %llu)\n", d.name.c_str(), d.width, (unsigned long long)val);
+            else if (modelSorts)
                 printf("%s = %llu : (_ BitVec %d)\n", d.name.c_str(), (unsigned long long)val, d.width);
             else
                 printf("%s = %llu\n", d.name.c_str(), (unsigned long long)val);
         }
     }
+    if (esbmcModel) printf(")\n");
     return 0;
 }
 
