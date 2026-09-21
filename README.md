@@ -102,3 +102,4 @@ See [GANSAT_Mathematical_Details.md](GANSAT_Mathematical_Details.md) and [NeuroS
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
