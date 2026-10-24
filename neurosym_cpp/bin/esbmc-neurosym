@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ESBMC="$(command -v esbmc || true)"
+if [ -z "$ESBMC" ]; then ESBMC="$HOME/VishResearch/esbmc"; fi
+exec "$ESBMC" --neurosym --neurosym-prog "$SCRIPT_DIR/neurosym-cpp-solve %f" "$@"
