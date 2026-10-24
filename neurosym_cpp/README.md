@@ -78,6 +78,11 @@ Known limitations:
 g++ -O2 -std=c++17 -o bitblast_solver bitblast_solver.cpp -lminisat
 ```
 
+This exact command was validated on the DGX. `bitblast_solver` must be
+linked against the same MiniSat library it runs with. A MiniSat ABI
+mismatch can give `undefined symbol: _ZN7Minisat10SimpSolver10addClause_...`;
+ensure the runtime loads the library used when linking the binary.
+
 Requires `libminisat.so.2` (or equivalent MiniSat shared library) and its
 headers available on the build system. The binary must be built at
 `neurosym_cpp/bitblast_solver` (i.e. right next to `bitblast_solver.cpp`,
