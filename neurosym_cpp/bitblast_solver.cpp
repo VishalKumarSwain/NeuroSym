@@ -2060,7 +2060,12 @@ static int run_solver(int argc, char **argv) {
     return 0;
 }
 
+#include "interactive.inc"
+
 int main(int argc, char **argv) {
+    // Persistent push/pop session over stdin/stdout; batch mode is unchanged.
+    if (argc == 2 && std::string(argv[1]) == "--interactive")
+        return nsi::run_interactive();
     try {
         return run_solver(argc, argv);
     } catch (const std::exception &e) {
